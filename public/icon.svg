@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Totem Night placeholder icon">
+  <defs>
+    <radialGradient id="g" cx="50%" cy="35%">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="45%" stop-color="#7a4dff"/>
+      <stop offset="100%" stop-color="#4f46e5"/>
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" rx="96" fill="#0a0a12"/>
+  <circle cx="256" cy="256" r="150" fill="url(#g)"/>
+</svg>
