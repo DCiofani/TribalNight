@@ -72,3 +72,26 @@ a {
   text-transform: uppercase;
   margin: 0;
 }
+
+/* Bottone: hover/active/focus richiedono pseudo-classi (non esprimibili inline) */
+.btn:not(:disabled):hover {
+  transform: translateY(-1px);
+}
+.btn:not(:disabled):active {
+  transform: translateY(0) scale(0.99);
+}
+.btn:focus-visible {
+  outline: 2px solid var(--eden-lavender);
+  outline-offset: 2px;
+}
+
+/* Accessibilità: rispetta la riduzione del movimento (motion totem/tap in arrivo) */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

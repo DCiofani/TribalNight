@@ -6,6 +6,18 @@ Tutte le modifiche rilevanti a **Totem Night**. Formato: [Keep a Changelog](http
 
 ## [Unreleased]
 
+### Added
+- **Schermate temporanee swappabili** (in attesa del design definitivo da Claude Design), generate e revisionate via Workflow multi-agente:
+  - Layer primitivi UI token-driven: `components/ui/{Screen,Card,Button,Stat,index}` + barrel.
+  - Componente `components/Totem.tsx` **isolato e sostituibile** (prop `level` 0–6, anelli/glow/scintille demo).
+  - Route funzionali-placeholder: `/onboarding` (form nome + T&C), `/guest` (Totem + saldi + ticket + QR/PIN + menù), `/cassa` (azioni ricarica/consuma), `/regia` (fasi + stats + controlli) — tutti con dati mock statici marcati `TODO(RPC)`/`TODO(realtime)`, nessun ricalcolo client.
+  - Route `/terms` (T&C provvisori) per chiudere il gate legale dell'onboarding.
+- A11y: classi `.btn` (hover/active/`:focus-visible`) + `@media (prefers-reduced-motion: reduce)` in `globals.css`.
+
+### Note
+- Review multi-agente (code-reviewer + spec-guardian): `tsc`/`lint` puliti; fix applicati (link T&C → `/terms`, oro riservato ai momenti-premio, focus-visible via CSS).
+- Verificato in locale nel browser (build verde, render OK guest/onboarding, zero errori console).
+
 _(prossimo: M1-S2 — hardening RPC `register_guest`/`topup` + suite contract/RLS test runtime)_
 
 ## [0.1.0] — 2026-06-24 — M1-S1 Fondamenta
