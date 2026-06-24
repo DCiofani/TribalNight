@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Totem 3D view</title>
+  <script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/3.5.0/model-viewer.min.js"></script>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0a0a12; }
+    model-viewer { width: 100vw; height: 100vh; }
+  </style>
+</head>
+<body>
+  <model-viewer
+    id="mv"
+    src="totem_v1.glb"
+    camera-controls
+    exposure="1.1"
+    shadow-intensity="0.7"
+    environment-image="neutral"
+    camera-orbit="0deg 85deg 110%"
+    field-of-view="32deg"
+  ></model-viewer>
+</body>
+</html>

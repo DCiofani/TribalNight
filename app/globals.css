@@ -95,3 +95,164 @@ a {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* ════════════ TotemStack — palo di maschere tiki che si "carica" ════════════
+   Componente eroe sostituibile. Le classi .tt-* sono isolate.
+   --tt-fill (0%→100%) = livello di carica (energia che sale dal basso).
+   --tt-glow (0→1)     = intensità aura/glow. Entrambe settate inline dal componente. */
+
+/* Proprietà custom registrata: rende --tt-fill animabile/tweenabile */
+@property --tt-fill {
+  syntax: '<percentage>';
+  inherits: true;
+  initial-value: 0%;
+}
+
+.tt {
+  position: relative;
+  display: grid;
+  place-items: center;
+  perspective: 900px;
+  --tt-fill: 0%;
+  --tt-glow: 0.15;
+  transition: --tt-fill 0.7s cubic-bezier(0.16, 1, 0.3, 1);
+  user-select: none;
+}
+
+/* carica automatica (splash S1): l'energia sale in loop */
+.tt--loading {
+  animation: tt-charge 2.6s ease-in-out infinite;
+}
+@keyframes tt-charge {
+  0% { --tt-fill: 0%; }
+  65% { --tt-fill: 100%; }
+  100% { --tt-fill: 100%; }
+}
+
+/* alone radiale viola dietro al totem, pulsa lento */
+.tt-glow {
+  position: absolute;
+  left: 50%;
+  top: 54%;
+  width: 130%;
+  height: 130%;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(circle, var(--eden-violet) 0%, transparent 62%);
+  opacity: var(--tt-glow);
+  filter: blur(10px);
+  pointer-events: none;
+  transition: opacity 0.6s ease;
+  animation: tt-pulse 4.5s ease-in-out infinite;
+}
+@keyframes tt-pulse {
+  0%, 100% { transform: translate(-50%, -50%) scale(1); }
+  50% { transform: translate(-50%, -50%) scale(1.07); }
+}
+
+/* anelli tribali concentrici */
+.tt-ring {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  border-radius: 50%;
+  border: 1px solid var(--eden-lavender);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  transition: opacity 0.5s ease;
+}
+
+/* palco 3D-soft: galleggia e ondeggia leggermente (pseudo-profondità) */
+.tt-stage {
+  position: relative;
+  transform-style: preserve-3d;
+  animation: tt-float 6.5s ease-in-out infinite;
+}
+@keyframes tt-float {
+  0%, 100% { transform: translateY(0) rotateX(5deg) rotateY(-3.5deg); }
+  50% { transform: translateY(-10px) rotateX(5deg) rotateY(3.5deg); }
+}
+
+/* il palo: contiene i due stack identici (base spenta + lit accesa) */
+.tt-pole { position: relative; }
+
+.tt-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.tt-seg {
+  display: block;
+  height: auto;
+  -webkit-user-drag: none;
+}
+
+/* layer base: maschere dormienti (dim + leggermente desaturate, NON grigio morto) */
+.tt-stack--base .tt-seg {
+  filter: brightness(0.46) saturate(0.55);
+}
+
+/* layer acceso: pieno colore + glow viola, rivelato dal basso fino a --tt-fill */
+.tt-stack--lit {
+  position: absolute;
+  inset: 0;
+  -webkit-mask-image: linear-gradient(
+    to top, #000 0%, #000 var(--tt-fill), transparent calc(var(--tt-fill) + 9%)
+  );
+  mask-image: linear-gradient(
+    to top, #000 0%, #000 var(--tt-fill), transparent calc(var(--tt-fill) + 9%)
+  );
+}
+.tt-stack--lit .tt-seg {
+  filter: drop-shadow(0 0 9px var(--eden-violet)) saturate(1.12);
+}
+
+/* linea d'energia all'altezza della carica */
+.tt-energy {
+  position: absolute;
+  left: -8%;
+  width: 116%;
+  height: 10px;
+  bottom: var(--tt-fill);
+  transform: translateY(50%);
+  background: linear-gradient(
+    90deg, transparent, var(--eden-lavender), var(--gold), var(--eden-lavender), transparent
+  );
+  filter: blur(3px);
+  opacity: calc(var(--tt-glow) * 0.9);
+  pointer-events: none;
+}
+
+/* scintille d'ambra/oro ai livelli alti, salgono e svaniscono */
+.tt-spark {
+  position: absolute;
+  top: 6%;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  opacity: 0;
+  animation: tt-rise 1.9s ease-in infinite;
+}
+@keyframes tt-rise {
+  0% { transform: translateY(14px) scale(0.5); opacity: 0; }
+  30% { opacity: 1; }
+  100% { transform: translateY(-46px) scale(1); opacity: 0; }
+}
+
+/* anello di caricamento (splash) */
+.tt-loader {
+  margin-top: 10px;
+  transform: rotate(-90deg);
+}
+.tt-loader-track { stroke: var(--night-700); }
+.tt-loader-fill {
+  stroke: url(#tt-loader-grad);
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.7s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.tt--loading .tt-loader-fill {
+  animation: tt-loader-spin 2.6s ease-in-out infinite;
+}
+@keyframes tt-loader-spin {
+  0% { stroke-dashoffset: var(--tt-circ); }
+  65%, 100% { stroke-dashoffset: 0; }
+}

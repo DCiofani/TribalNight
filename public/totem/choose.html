@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Scegli stile — geometrico vs cosmic</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; background: #0a0a12; color: #c9c4db;
+      font-family: system-ui, -apple-system, sans-serif; padding: 24px 16px 56px; }
+    h1 { font-size: 16px; letter-spacing: .16em; text-transform: uppercase; text-align: center;
+         color: #f5c451; font-weight: 800; margin: 8px 0 4px; }
+    h2 { font-size: 14px; letter-spacing: .14em; text-transform: uppercase; text-align: center;
+         color: #a78bfa; font-weight: 700; margin: 34px 0 14px; }
+    p.sub { text-align: center; color: #6f6a82; font-size: 12px; margin: 0 0 8px; }
+    .row { display: flex; gap: 18px; flex-wrap: wrap; justify-content: center; align-items: flex-start; }
+    .card { background: #14111f; border: 1px solid #1e1a2e; border-radius: 16px; padding: 10px; }
+    .card img { display: block; border-radius: 10px; width: 250px; max-width: 78vw; }
+    .cap { text-align: center; margin-top: 8px; font-size: 12px; color: #6f6a82; letter-spacing: .06em; }
+    hr { border: none; border-top: 1px solid #1e1a2e; margin: 30px auto; max-width: 820px; }
+  </style>
+</head>
+<body>
+  <h1>Scegli lo stile unico</h1>
+  <p class="sub">stesso stile per tutti · ogni persona avrà un totem random in questo stile</p>
+
+  <h2>A · Geometrico</h2>
+  <div class="row">
+    <div class="card"><img src="varied/t3.png" alt="geo1" /><div class="cap">A1</div></div>
+    <div class="card"><img src="choose/c1.png" alt="geo2" /><div class="cap">A2</div></div>
+    <div class="card"><img src="choose/c2.png" alt="geo3" /><div class="cap">A3</div></div>
+  </div>
+
+  <hr />
+
+  <h2>B · Cosmic</h2>
+  <div class="row">
+    <div class="card"><img src="more/t_cosmic.png" alt="cos1" /><div class="cap">B1</div></div>
+    <div class="card"><img src="choose/c3.png" alt="cos2" /><div class="cap">B2</div></div>
+    <div class="card"><img src="choose/c4.png" alt="cos3" /><div class="cap">B3</div></div>
+  </div>
+</body>
+</html>
