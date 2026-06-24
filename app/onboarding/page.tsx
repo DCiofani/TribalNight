@@ -1,25 +1,61 @@
 // TEMP — swappabile quando arriva il design (Claude Design).
 // Schermata Ospite / onboarding §7.1 — presentazione isolata dalla logica.
-// Nessuna business logic nel client: saldi/ticket sono placeholder statici (vincolo dati).
+// Cablaggio M1-S3: anon sign-in -> register_guest (current_event) -> persisti
+// guestId in localStorage -> /guest. Nessun ricalcolo: la riga guests è autoritativa.
 'use client';
 
 import React, { useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { Screen, Card, Button, Stat } from '@/components/ui';
 import Totem from '@/components/Totem';
+import { createClient } from '@/lib/supabase/client';
+import { registerGuest, RpcError } from '@/lib/rpc';
+import { saveGuestId } from '@/lib/guest-session';
 
 export default function OnboardingPage() {
+  const router = useRouter();
   const [nome, setNome] = useState('');
   const [accettato, setAccettato] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [errore, setErrore] = useState<string | null>(null);
 
   const nomeValido = nome.trim().length > 0;
-  const puoEntrare = nomeValido && accettato;
+  const puoEntrare = nomeValido && accettato && !submitting;
 
-  function handleEntra(e: React.FormEvent) {
+  async function handleEntra(e: React.FormEvent) {
     e.preventDefault();
     if (!puoEntrare) return;
-    // TODO(RPC): anonymous sign-in (Supabase auth.signInAnonymously)
-    // TODO(RPC): register_guest(current_event, nome.trim()) — SECURITY DEFINER
-    // Dopo la registrazione: il PIN/QR dell'ospite verrà generato e mostrato (M2/M3).
+
+    setSubmitting(true);
+    setErrore(null);
+
+    try {
+      const supabase = createClient();
+
+      // Sessione anonima idempotente: firma solo se assente.
+      const { data: sessionData } = await supabase.auth.getSession();
+      if (!sessionData.session) {
+        const { error: authErr } = await supabase.auth.signInAnonymously();
+        if (authErr) throw authErr;
+      }
+
+      // register_guest risolve l'evento corrente internamente (current_event()).
+      const guest = await registerGuest(supabase, nome);
+
+      // Persisti SOLO l'id (puntatore). PIN/saldi NON vanno in localStorage.
+      saveGuestId(guest.id);
+
+      router.push('/guest');
+    } catch (err) {
+      if (err instanceof RpcError && err.code === 'NO_EVENT') {
+        setErrore('Nessun evento attivo. Riprova più tardi.');
+      } else if (err instanceof RpcError && err.code === '42501') {
+        setErrore('Operazione non consentita.');
+      } else {
+        setErrore('Impossibile completare l’accesso. Riprova.');
+      }
+      setSubmitting(false);
+    }
   }
 
   return (
@@ -93,8 +129,15 @@ export default function OnboardingPage() {
           </label>
         </Card>
 
+        {/* Errore inline — riusa la Card con accento ember (no dettagli RLS all'utente). */}
+        {errore && (
+          <Card style={{ marginBottom: 16, borderColor: 'var(--ember)' }}>
+            <p style={{ margin: 0, fontSize: 14, color: 'var(--ink-0)' }}>{errore}</p>
+          </Card>
+        )}
+
         <Button type="submit" variant="primary" disabled={!puoEntrare}>
-          Entra
+          {submitting ? 'Entro…' : 'Entra'}
         </Button>
       </form>
 

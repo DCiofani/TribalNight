@@ -23,7 +23,21 @@ Tutte le modifiche rilevanti a **Totem Night**. Formato: [Keep a Changelog](http
 - Dipendenza `pg` + script `npm test` (`node --test`); CI estesa: il job migrazione ora applica schema + assert + **esegue i test** su Postgres effimero.
 - ✅ **29/29 test verdi** su Postgres 15 reale (Docker locale): register_guest 6, topup 11, RLS 12, 0 fail.
 
-_(prossimo: M1-S3 — wiring reale onboarding (`register_guest`) + cassa (`topup`) con Supabase, realtime `guest:state`)_
+### Added (M1-S3 — wiring reale)
+- Data-layer client (via Workflow multi-agente: analyst → implementer → e2e → review):
+  - `lib/rpc.ts`: wrapper tipizzati `registerGuest`/`topup` (idem key client) + `RpcError`.
+  - `lib/useGuestState.ts`: hook realtime su `guests` (saldi/ticket/livello/pin) — fetch iniziale + re-fetch su evento postgres_changes (le colonne GENERATED non sono nel payload) + teardown.
+  - `lib/guest-session.ts`: persistenza `guestId` (localStorage, SSR-safe).
+- `/onboarding` cablato: anonymous sign-in → `register_guest` (`current_event`) → salva guestId → `/guest`. `/guest` mostra dati LIVE (no mock, no ricalcolo client).
+- `supabase/config.toml` (stack locale `supabase start`, anonymous sign-in abilitato).
+
+### Testing (M1-S3)
+- **E2E REALE** `tests/e2e_supabase.test.mjs` (supabase-js contro Supabase locale): admin crea utente staff `cassa` → ospite anon sign-in → `register_guest` → `topup` (cassa) → ospite rilegge saldo via RLS → **idempotenza** (stesso idem non raddoppia). Skip pulito se env assente.
+- ✅ **30/30 test verdi** su Supabase locale reale (29 contract/RLS DB + 1 e2e full-path). Build/lint/typecheck verdi.
+- ✅ **Verifica browser**: onboarding → /guest live (guest creato nel DB, saldi/ticket/totem reali via `useGuestState`), zero errori console.
+- Nota CI: l'e2e fa skip in CI (nessuno stack Supabase nel runner); i 29 contract/RLS girano su Postgres effimero. L'e2e è un gate locale (`supabase start`).
+
+_(prossimo: M1-S3 cassa `topup` UI con login staff, poi M2 bar loop `consume`)_
 
 ## [0.1.0] — 2026-06-24 — M1-S1 Fondamenta
 

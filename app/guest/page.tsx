@@ -2,43 +2,72 @@
 //
 // Schermata OSPITE (spec §10).
 // PRESENTAZIONE isolata dalla logica: usa solo i primitivi UI e il Totem.
-// Il front-end NON calcola MAI saldi/ticket: tutti i valori sotto sono
-// PLACEHOLDER STATICI marcati TODO(realtime guest:state). I dati veri
-// arriveranno da RPC SECURITY DEFINER + Supabase Realtime (M2/M3).
-//
-// Questa pagina è un Server Component statico: nessuna interattività/stato
-// richiesta qui, quindi niente 'use client'.
-import React from 'react';
+// Cablaggio M1-S3: dati LIVE da public.guests via useGuestState (RLS + Realtime).
+// Il front-end NON calcola MAI saldi/ticket/livello: mostra la riga e basta.
+'use client';
+
+import React, { useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { Screen, Card, Button, Stat } from '@/components/ui';
 import Totem from '@/components/Totem';
+import { loadGuestId } from '@/lib/guest-session';
+import { useGuestState } from '@/lib/useGuestState';
 
-// TODO(realtime guest:state): valori finti finché non arriva il payload reale.
-// Tutto ciò che segue è segnaposto e NON va trattato come dato di dominio.
-const MOCK = {
-  // livello del totem 0–6 (mappato su totem_level()). Demo: valore intermedio.
-  totemLevel: 3 as number,
-  // saldi: il client mostra solo, non somma/sottrae mai.
-  saldoNormali: 0,
-  saldoPremium: 0,
-  ticketTotali: 0,
-  // PIN cassa: placeholder a 4 caselle finché non arriva da guest:state.
-  pin: ['—', '—', '—', '—'],
-  // menù: voci finte di esempio (tag = tipo). Sostituibili dal catalogo reale.
-  menu: [
-    { nome: 'Cocktail della casa', tipo: 'Premium' },
-    { nome: 'Birra alla spina', tipo: 'Normale' },
-    { nome: 'Acqua / Soft drink', tipo: 'Normale' },
-  ] as { nome: string; tipo: string }[],
-};
+// Menù placeholder: il catalogo `drinks` reale è altro task (fuori scope S3).
+const MENU: { nome: string; tipo: string }[] = [
+  { nome: 'Cocktail della casa', tipo: 'Premium' },
+  { nome: 'Birra alla spina', tipo: 'Normale' },
+  { nome: 'Acqua / Soft drink', tipo: 'Normale' },
+];
+
+// Spezza il PIN in 4 caselle; "—" finché non c'è il valore.
+function pinDigits(pin: string | null): string[] {
+  const base = (pin ?? '').slice(0, 4).split('');
+  while (base.length < 4) base.push('—');
+  return base;
+}
 
 export default function GuestPage() {
+  const router = useRouter();
+
+  // guestId letto SOLO lato client (evita mismatch SSR): parte da undefined,
+  // diventa string|null dopo il mount.
+  const [guestId, setGuestId] = useState<string | null | undefined>(undefined);
+
+  useEffect(() => {
+    const id = loadGuestId();
+    if (!id) {
+      // Ospite non registrato: torna all'onboarding.
+      router.replace('/onboarding');
+    }
+    setGuestId(id);
+  }, [router]);
+
+  const {
+    pin,
+    saldoNormale,
+    saldoPremium,
+    ticketTotali,
+    livelloTotem,
+    error,
+  } = useGuestState(guestId ?? null);
+
+  const pin4 = pinDigits(pin);
+
   return (
     <Screen kicker="Ospite" title="Il tuo Totem">
-      {/* Eroe centrale: Totem isolato/sostituibile. level già risolto a monte. */}
-      {/* TODO(realtime guest:state): level arriverà da totem_level() via realtime. */}
-      <Totem level={MOCK.totemLevel} />
+      {/* Eroe centrale: livello autoritativo da livello_totem (DB), 0 in attesa. */}
+      <Totem level={livelloTotem ?? 0} />
 
-      {/* Saldi: due tile affiancate (Normali / Premium). Valori = placeholder. */}
+      {error && (
+        <Card style={{ marginTop: 12, borderColor: 'var(--ember)' }}>
+          <p style={{ margin: 0, fontSize: 14, color: 'var(--ink-0)' }}>
+            Impossibile caricare lo stato.
+          </p>
+        </Card>
+      )}
+
+      {/* Saldi: due tile affiancate (Normali / Premium). Solo lettura. */}
       <div
         style={{
           display: 'grid',
@@ -47,17 +76,13 @@ export default function GuestPage() {
           marginTop: 8,
         }}
       >
-        {/* TODO(realtime guest:state): saldo gettoni Normali */}
-        <Stat label="Saldo Normali" value={MOCK.saldoNormali} tone="normale" />
-        {/* TODO(realtime guest:state): saldo gettoni Premium */}
-        <Stat label="Saldo Premium" value={MOCK.saldoPremium} tone="premium" />
+        <Stat label="Saldo Normali" value={saldoNormale ?? '—'} tone="normale" />
+        <Stat label="Saldo Premium" value={saldoPremium ?? '—'} tone="premium" />
       </div>
 
-      {/* Ticket totali: tile a larghezza piena. Oro riservato ai momenti-premio
-          (reveal vincitore, ticket appena guadagnati) — qui a riposo, accento neutro. */}
+      {/* Ticket totali: tile a larghezza piena (GENERATED lato DB). */}
       <div style={{ marginTop: 12 }}>
-        {/* TODO(realtime guest:state): conteggio ticket totali */}
-        <Stat label="Ticket totali" value={MOCK.ticketTotali} tone="normale" />
+        <Stat label="Ticket totali" value={ticketTotali ?? '—'} tone="normale" />
       </div>
 
       {/* Blocco "Mostra alla cassa": QR placeholder + PIN. */}
@@ -73,8 +98,7 @@ export default function GuestPage() {
             gap: 16,
           }}
         >
-          {/* QR placeholder: riquadro segnaposto. Il QR reale arriva da guest:state. */}
-          {/* TODO(realtime guest:state): rimpiazza con il QR firmato della sessione. */}
+          {/* QR firmato = TODO(M2/M3), fuori scope S3: resta placeholder. */}
           <div
             role="img"
             aria-label="Codice QR non ancora disponibile"
@@ -96,22 +120,21 @@ export default function GuestPage() {
             QR in arrivo
           </div>
 
-          {/* PIN cassa: 4 caselle. Placeholder "—" finché non arriva il valore. */}
+          {/* PIN cassa: 4 caselle. Valore reale dalla propria riga (RLS-ok). */}
           <div style={{ width: '100%' }}>
             <p className="tag" style={{ marginBottom: 8 }}>
               PIN cassa
             </p>
             <div
               role="group"
-              aria-label="PIN cassa, non ancora disponibile"
+              aria-label="PIN cassa"
               style={{
                 display: 'grid',
                 gridTemplateColumns: 'repeat(4, 1fr)',
                 gap: 8,
               }}
             >
-              {/* TODO(realtime guest:state): cifre PIN reali della sessione */}
-              {MOCK.pin.map((cifra, i) => (
+              {pin4.map((cifra, i) => (
                 <div
                   key={i}
                   aria-hidden="true"
@@ -136,14 +159,13 @@ export default function GuestPage() {
         </div>
       </Card>
 
-      {/* Menù placeholder: voci finte con tag tipo. Sostituibili dal catalogo reale. */}
+      {/* Menù placeholder: catalogo `drinks` reale = altro task. */}
       <section style={{ marginTop: 16 }}>
         <p className="tag" style={{ marginBottom: 8 }}>
           Menù
         </p>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {/* TODO(realtime guest:state): lista voci menù dal catalogo reale */}
-          {MOCK.menu.map((voce, i) => (
+          {MENU.map((voce, i) => (
             <Card
               key={i}
               style={{
@@ -160,9 +182,8 @@ export default function GuestPage() {
         </div>
       </section>
 
-      {/* Azione segnaposto: nessuna logica collegata (presentazione). */}
+      {/* Azione segnaposto: lo stato si aggiorna da solo via Realtime. */}
       <div style={{ marginTop: 16 }}>
-        {/* TODO(realtime guest:state): collegare ad azione reale (es. aggiorna stato). */}
         <Button variant="ghost" disabled>
           Aggiorna stato
         </Button>
