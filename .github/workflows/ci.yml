@@ -26,7 +26,7 @@ jobs:
           NEXT_PUBLIC_APP_NAME: Totem Night
 
   migration:
-    name: Migrazione schema v0.2 (clean apply + contract assert)
+    name: Migrazione v0.2 + contract/RLS test (Postgres reale)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -42,16 +42,24 @@ jobs:
           --health-retries 10
     env:
       DB: postgres://postgres:postgres@localhost:5432/totem
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/totem
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
       - name: Install psql client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - run: npm ci
       - name: Prelude (shim ruoli + auth)
         run: psql "$DB" -v ON_ERROR_STOP=1 -f supabase/ci/prelude.sql
       - name: Apply migration (clean)
         run: psql "$DB" -v ON_ERROR_STOP=1 -f supabase/migrations/0001_init.sql
       - name: Assert contratto v0.2
         run: psql "$DB" -v ON_ERROR_STOP=1 -f supabase/ci/assert.sql
+      - name: Contract/RLS/idempotenza test (M1-S2, esecuzione reale)
+        run: npm test
       # Nota: lo schema NON è re-runnable as-is (create policy/role senza guardie) — vedi
       # docs/design/v0.2-reconciliation.md (gap idempotenza). Le migrazioni Supabase
-      # girano una volta sola; i contract/RLS test runtime arrivano in M1-S2.
+      # girano una volta sola.

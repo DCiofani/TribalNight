@@ -18,7 +18,12 @@ Tutte le modifiche rilevanti a **Totem Night**. Formato: [Keep a Changelog](http
 - Review multi-agente (code-reviewer + spec-guardian): `tsc`/`lint` puliti; fix applicati (link T&C → `/terms`, oro riservato ai momenti-premio, focus-visible via CSS).
 - Verificato in locale nel browser (build verde, render OK guest/onboarding, zero errori console).
 
-_(prossimo: M1-S2 — hardening RPC `register_guest`/`topup` + suite contract/RLS test runtime)_
+### Testing (M1-S2)
+- **Suite di test REALE** (no mock) per `register_guest` + `topup` + RLS, generata via Workflow multi-agente (test-strategist → test-author): `tests/db.mjs` (harness `pg` + simulazione auth `set local role authenticated` + `request.jwt.claims`, `actAs`/`expectReject` con savepoint) + `tests/{register_guest,topup,rls}.test.mjs`. Casi: contract, idempotenza, gating fase, authz, validazione, RLS per ruolo, default-deny scritture dirette. Documenta il finding **R-01** (idem riusato con parametri diversi → ritorna la tx originale).
+- Dipendenza `pg` + script `npm test` (`node --test`); CI estesa: il job migrazione ora applica schema + assert + **esegue i test** su Postgres effimero.
+- ✅ **29/29 test verdi** su Postgres 15 reale (Docker locale): register_guest 6, topup 11, RLS 12, 0 fail.
+
+_(prossimo: M1-S3 — wiring reale onboarding (`register_guest`) + cassa (`topup`) con Supabase, realtime `guest:state`)_
 
 ## [0.1.0] — 2026-06-24 — M1-S1 Fondamenta
 
