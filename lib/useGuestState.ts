@@ -7,11 +7,12 @@
 //    id=eq.<guestId> -> teardown con removeChannel su unmount/cambio guestId.
 //    Realtime PUSH dal DB: zero polling.
 //
-//  • api (Fase 3 strangler): fetch iniziale GET /api/guest/[id] + POLLING ogni 2s
-//    (setInterval, teardown clearInterval) per riallineare. Niente WebSocket: il
-//    backend nuovo non espone ancora un canale realtime.
-//    TODO(SSE): Fase 4 sostituirà il polling con un Server-Sent Events / WebSocket
-//    su /api/guest/[id]/stream così da eliminare il roundtrip ogni 2s.
+//  • api (Fase 4 strangler): fetch iniziale GET /api/guest/[id] + REALTIME via
+//    EventSource su /api/stream/guest?guest=<id> (Postgres LISTEN/NOTIFY -> SSE).
+//    L'evento SSE è un puro segnale "qualcosa è cambiato" (NESSUN dato nel payload):
+//    ad ogni evento — e su onopen e su visibilitychange — si fa un refetch
+//    autoritativo GET /api/guest/[id] (RLS-scoped). Su errore: reconnect con backoff;
+//    se EventSource non è disponibile o l'errore persiste, FALLBACK al polling 2s.
 //
 // In ENTRAMBI i path: shape di ritorno identica (snake_case DB -> camelCase),
 // SOLA LETTURA, nessun ricalcolo client-side. Questo modulo NON importa lib/db né
@@ -25,9 +26,16 @@ import type { GuestRow } from '@/lib/rpc';
 const GUEST_COLUMNS =
   'id, nome, pin, saldo_normale, saldo_premium, ticket_totali, livello_totem';
 
-// Intervallo di polling del path API. Tenuto basso per dare un feeling "live"
-// in cassa/ospite senza realtime. TODO(SSE) Fase 4: rimuovere col push server.
+// Intervallo del polling di FALLBACK del path API: usato solo se EventSource non
+// è disponibile o se lo stream SSE fallisce in modo persistente. In condizioni
+// normali il realtime arriva via SSE (push), senza alcun polling.
 const API_POLL_MS = 2000;
+
+// Backoff di riconnessione dello stream SSE: parte da ~1s, raddoppia fino a un cap.
+// Oltre MAX tentativi consecutivi senza un'apertura riuscita si scende al polling.
+const SSE_BACKOFF_MIN_MS = 1000;
+const SSE_BACKOFF_MAX_MS = 15000;
+const SSE_MAX_RETRIES_BEFORE_FALLBACK = 5;
 
 type GuestStateRow = Pick<
   GuestRow,
@@ -91,8 +99,9 @@ export function useGuestState(guestId: string | null): UseGuestStateResult {
     setLoading(true);
     setError(null);
 
-    // ── Path API (backend nuovo) ─────────────────────────────────────────────
-    // Fetch iniziale + polling ogni API_POLL_MS. Nessun supabase-js qui.
+    // ── Path API (backend nuovo, Fase 4) ─────────────────────────────────────
+    // Fetch iniziale + REALTIME via SSE. Polling solo come fallback. Nessun
+    // supabase-js qui: si parla col backend via fetch() + EventSource.
     if (USE_API) {
       let active = true;
 
@@ -134,18 +143,123 @@ export function useGuestState(guestId: string | null): UseGuestStateResult {
         }
       };
 
-      // (a) Stato corrente subito.
-      void fetchRow();
-      // (b) Riallineamento periodico finché il guestId è montato.
-      //     TODO(SSE) Fase 4: rimpiazzare con stream push, niente setInterval.
-      const timer = setInterval(() => {
-        void fetchRow();
-      }, API_POLL_MS);
+      // Risorse gestite dall'effetto: vengono azzerate nel teardown. `es`/`pollTimer`
+      // sono mutuamente esclusivi (o stream SSE, o polling di fallback).
+      let es: EventSource | null = null;
+      let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+      let pollTimer: ReturnType<typeof setInterval> | null = null;
+      let retries = 0;
 
-      // (c) Teardown: stop aggiornamenti + stop polling (evita doppi timer/leak).
+      const clearReconnect = () => {
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+      };
+
+      const closeStream = () => {
+        if (es) {
+          es.close();
+          es = null;
+        }
+        clearReconnect();
+      };
+
+      // FALLBACK: polling 2s. Usato se EventSource non esiste o se lo stream SSE
+      // fallisce ripetutamente. Idempotente: non avvia due timer.
+      const startPolling = () => {
+        closeStream();
+        if (pollTimer) return;
+        void fetchRow();
+        pollTimer = setInterval(() => {
+          void fetchRow();
+        }, API_POLL_MS);
+      };
+
+      // Apertura/riapertura dello stream SSE. onopen/onmessage/onerror -> refetch o
+      // reconnect con backoff. Il payload SSE non porta dati: rileggiamo sempre.
+      const connect = () => {
+        if (!active) return;
+        clearReconnect();
+        try {
+          es = new EventSource(
+            '/api/stream/guest?guest=' + encodeURIComponent(guestId),
+            { withCredentials: true },
+          );
+        } catch {
+          // Costruttore non disponibile/errore sincrono: vai in polling.
+          startPolling();
+          return;
+        }
+
+        // Apertura riuscita: refetch autoritativo e reset del backoff.
+        es.onopen = () => {
+          if (!active) return;
+          retries = 0;
+          void fetchRow();
+        };
+
+        // Ogni evento (default `message` o named `state`) = trigger di refetch.
+        const onSignal = () => {
+          if (!active) return;
+          void fetchRow();
+        };
+        es.onmessage = onSignal;
+        es.addEventListener('state', onSignal);
+
+        // Errore di rete/stream: il browser potrebbe già ritentare da solo, ma noi
+        // chiudiamo e gestiamo il backoff esplicitamente (e il fallback al polling
+        // dopo troppi tentativi falliti consecutivi).
+        es.onerror = () => {
+          if (!active) return;
+          if (es) {
+            es.close();
+            es = null;
+          }
+          retries += 1;
+          if (retries > SSE_MAX_RETRIES_BEFORE_FALLBACK) {
+            // SSE non regge in questo ambiente: degrada al polling 2s.
+            startPolling();
+            return;
+          }
+          const delay = Math.min(
+            SSE_BACKOFF_MAX_MS,
+            SSE_BACKOFF_MIN_MS * 2 ** (retries - 1),
+          );
+          clearReconnect();
+          reconnectTimer = setTimeout(connect, delay);
+        };
+      };
+
+      // Refetch quando la tab torna visibile: copre eventi persi mentre era nascosta
+      // (alcuni browser sospendono lo stream in background).
+      const onVisibility = () => {
+        if (!active) return;
+        if (document.visibilityState === 'visible') {
+          void fetchRow();
+        }
+      };
+
+      // (a) Stato corrente subito (non aspettare il primo evento/apertura).
+      void fetchRow();
+      // (b) Realtime via SSE, con fallback a polling se non supportato.
+      if (typeof EventSource === 'undefined') {
+        startPolling();
+      } else {
+        connect();
+      }
+      // (c) Refetch sul ritorno in foreground.
+      document.addEventListener('visibilitychange', onVisibility);
+
+      // (d) Teardown: stop refetch + chiudi stream/timer + rimuovi listener.
       return () => {
         active = false;
-        clearInterval(timer);
+        document.removeEventListener('visibilitychange', onVisibility);
+        closeStream();
+        if (pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
       };
     }
 
