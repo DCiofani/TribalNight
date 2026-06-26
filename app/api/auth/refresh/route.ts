@@ -1,7 +1,7 @@
 // POST /api/auth/refresh — rotazione del refresh token.
 //
 // Legge il cookie tn_rt, lo passa a rotateRefresh che: verifica l'hash in
-// auth.refresh_tokens, controlla non-scaduto/non-revocato/non-riusato, REVOCA il vecchio
+// app_auth.refresh_tokens, controlla non-scaduto/non-revocato/non-riusato, REVOCA il vecchio
 // (replaced_by) ed emette una NUOVA coppia { access, refresh }. La rotazione ad ogni uso è
 // la mitigazione anti-replay: un refresh rubato e già usato risulta "consumato" →
 // rotateRefresh ritorna null → 401 + clear cookie.

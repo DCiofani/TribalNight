@@ -1,7 +1,7 @@
 // POST /api/auth/logout — chiude la sessione.
 //
 // Sostituisce supabase.auth.signOut(). Revoca il refresh token corrente
-// (auth.refresh_tokens.revoked_at=now(), via refresh.ts::revoke) e cancella ENTRAMBI i
+// (app_auth.refresh_tokens.revoked_at=now(), via refresh.ts::revoke) e cancella ENTRAMBI i
 // cookie. Idempotente: se non c'è refresh, pulisce comunque i cookie e risponde 200 (il
 // logout non deve mai fallire lato UX).
 //

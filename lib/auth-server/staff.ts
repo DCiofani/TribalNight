@@ -1,8 +1,8 @@
 import 'server-only';
 
-// staff.ts — lookup di auth.staff_users per il login (verifica password lato server).
+// staff.ts — lookup di app_auth.staff_users per il login (verifica password lato server).
 //
-// Le tabelle auth.* NON sono leggibili dal ruolo `authenticated` (sono dati di sistema,
+// Le tabelle app_auth.* NON sono leggibili dal ruolo `authenticated` (sono dati di sistema,
 // mai esposti via RLS al client): quindi qui NON si usa lib/db.ts::withAuth. Si usa il
 // pool DEDICATO DI SERVIZIO unico (lib/auth-server/service-db.ts: ruolo owner/service,
 // query dirette senza SET ROLE), condiviso con refresh.ts. Non eredita mai claims utente.
@@ -35,7 +35,7 @@ export async function lookupStaffForLogin(
 
   const res = await serviceDb().query(
     `select id, password_hash, role
-       from auth.staff_users
+       from app_auth.staff_users
       where lower(email) = $1
         and disabled_at is null
       limit 1`,

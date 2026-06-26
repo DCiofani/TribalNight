@@ -35,7 +35,7 @@ export function serviceDb(): pg.Pool {
       'service-db: connection string di servizio assente. Imposta AUTH_DB_URL ' +
         '(o DATABASE_URL_DIRECT) a una URL DIRETTA al Postgres plugin con ruolo ' +
         'owner/service. NON si usa DATABASE_URL (authenticator NOINHERIT, senza grant ' +
-        'su auth.*): le query su auth.staff_users / auth.refresh_tokens fallirebbero.',
+        'su app_auth.*): le query su app_auth.staff_users / app_auth.refresh_tokens fallirebbero.',
     );
   }
 

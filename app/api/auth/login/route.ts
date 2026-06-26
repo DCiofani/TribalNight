@@ -5,7 +5,7 @@
 //
 // Pipeline:
 //   1. valida input (email+password non vuoti);
-//   2. lookupStaffForLogin(email) → riga auth.staff_users (id, password_hash, role) o null;
+//   2. lookupStaffForLogin(email) → riga app_auth.staff_users (id, password_hash, role) o null;
 //   3. verifyPassword(hash, password) (argon2id);
 //   4. su match: issueRefresh(staff.id, staff.role) emette access {sub,role} + refresh opaco
 //      persistito (rotazione abilitata); setta i cookie; ritorna { role }.

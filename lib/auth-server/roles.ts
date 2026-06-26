@@ -7,7 +7,7 @@
 // sola definizione. La forma è identica a quella in lib/auth.ts e tests/db.mjs.
 
 // Ruoli staff autorizzati alle postazioni protette. Combaciano col CHECK su
-// auth.staff_users.role e con app_metadata.role letto da is_staff() nel DB.
+// app_auth.staff_users.role e con app_metadata.role letto da is_staff() nel DB.
 export const STAFF_ROLES = ['cassa', 'regia', 'admin'] as const;
 export type StaffRole = (typeof STAFF_ROLES)[number];
 

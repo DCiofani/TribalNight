@@ -9,7 +9,7 @@ import 'server-only';
 //
 // `sub` DEVE essere un UUID valido: auth.uid() (prelude.sql) fa il cast a uuid e
 // altrimenti esplode. buildAnonClaims() genera sempre un randomUUID(), buildStaffClaims()
-// riceve l'id dello staff (= auth.staff_users.id, già uuid).
+// riceve l'id dello staff (= app_auth.staff_users.id, già uuid).
 //
 // Questi oggetti sono ciò che viene:
 //   1) firmato nel JWT (jwt.ts signAccess) per il trasporto browser<->backend;
@@ -38,7 +38,7 @@ export function buildAnonClaims(): GuestClaims {
 }
 
 // buildStaffClaims(sub, role) -> { sub, app_metadata:{ role } }.
-// sub = auth.staff_users.id (uuid). role validato contro STAFF_ROLES.
+// sub = app_auth.staff_users.id (uuid). role validato contro STAFF_ROLES.
 export function buildStaffClaims(sub: string, role: StaffRole): StaffClaims {
   if (!isValidUuid(sub)) {
     throw new Error(`buildStaffClaims: sub non è un UUID valido: ${sub}`);

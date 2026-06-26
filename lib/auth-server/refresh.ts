@@ -54,7 +54,7 @@ export interface IssuedSession {
 
 // ── issueRefresh(sub, role) ─────────────────────────────────────────────────────────
 // Emette una nuova coppia { access, refresh } e PERSISTE l'hash del refresh in
-// auth.refresh_tokens. role = null/undefined per l'ospite anonimo, altrimenti uno
+// app_auth.refresh_tokens. role = null/undefined per l'ospite anonimo, altrimenti uno
 // STAFF_ROLES. Restituisce i valori in chiaro da mettere nei cookie.
 export async function issueRefresh(
   sub: string,
@@ -67,7 +67,7 @@ export async function issueRefresh(
   const tokenHash = sha256Hex(refresh);
 
   await serviceDb().query(
-    `insert into auth.refresh_tokens (token_hash, sub, role, issued_at, expires_at)
+    `insert into app_auth.refresh_tokens (token_hash, sub, role, issued_at, expires_at)
        values ($1, $2, $3, now(), now() + make_interval(secs => $4))`,
     [tokenHash, sub, normalizedRole, REFRESH_TTL_SECONDS]
   );
@@ -96,7 +96,7 @@ export async function rotateRefresh(
     // FOR UPDATE: serializza un eventuale uso concorrente dello stesso refresh.
     const found = await client.query(
       `select token_hash, sub, role, expires_at, revoked_at
-         from auth.refresh_tokens
+         from app_auth.refresh_tokens
         where token_hash = $1
         for update`,
       [incomingHash]
@@ -147,7 +147,7 @@ export async function rotateRefresh(
     const newHash = sha256Hex(newRefresh);
 
     const inserted = await client.query(
-      `insert into auth.refresh_tokens (token_hash, sub, role, issued_at, expires_at)
+      `insert into app_auth.refresh_tokens (token_hash, sub, role, issued_at, expires_at)
          values ($1, $2, $3, now(), now() + make_interval(secs => $4))
        returning id`,
       [newHash, row.sub, normalizedRole, REFRESH_TTL_SECONDS]
@@ -156,7 +156,7 @@ export async function rotateRefresh(
 
     // Revoca + collega il vecchio al nuovo (replaced_by è uuid FK a id → usa l'id, non l'hash).
     await client.query(
-      `update auth.refresh_tokens
+      `update app_auth.refresh_tokens
           set revoked_at = now(), replaced_by = $2
         where token_hash = $1`,
       [incomingHash, newId]
@@ -181,7 +181,7 @@ export async function revoke(token: string | undefined | null): Promise<void> {
   if (!token) return;
   const tokenHash = sha256Hex(token);
   await serviceDb().query(
-    `update auth.refresh_tokens
+    `update app_auth.refresh_tokens
         set revoked_at = now()
       where token_hash = $1 and revoked_at is null`,
     [tokenHash]
@@ -193,7 +193,7 @@ export async function revoke(token: string | undefined | null): Promise<void> {
 // Ritorna il numero di refresh revocati.
 export async function revokeAllForSub(sub: string): Promise<number> {
   const res = await serviceDb().query(
-    `update auth.refresh_tokens
+    `update app_auth.refresh_tokens
         set revoked_at = now()
       where sub = $1 and revoked_at is null`,
     [sub]

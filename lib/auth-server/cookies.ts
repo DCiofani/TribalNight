@@ -28,7 +28,7 @@ const isProd = process.env.NODE_ENV === 'production';
 // TTL dei cookie in secondi. NB: la SCADENZA AUTORITATIVA dell'access token è
 // dentro il JWT (claim exp, verificata server-side); il Max-Age del cookie è solo
 // un suggerimento al browser. Per il refresh (opaco) la scadenza autoritativa è in
-// auth.refresh_tokens.expires_at. Teniamo i Max-Age allineati ai TTL del token.
+// app_auth.refresh_tokens.expires_at. Teniamo i Max-Age allineati ai TTL del token.
 export const AT_MAX_AGE = 15 * 60; // 15 min
 export const RT_MAX_AGE = 24 * 60 * 60; // 24h (durata di una serata)
 

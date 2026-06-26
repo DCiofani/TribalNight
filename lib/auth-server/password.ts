@@ -3,7 +3,7 @@ import 'server-only';
 // password.ts — hashing/verifica password staff con argon2id.
 //
 // Usato SOLO server-side (route /api/auth/login, seed/CLI creazione staff).
-// L'hash finisce in auth.staff_users.password_hash; la password in chiaro non
+// L'hash finisce in app_auth.staff_users.password_hash; la password in chiaro non
 // lascia mai il backend. argon2id = variante raccomandata OWASP (resistente sia a
 // side-channel sia a GPU/TPU cracking).
 //

@@ -75,12 +75,20 @@ export async function apiPatch<T = unknown>(path: string, body?: unknown): Promi
   return parseOk<T>(res);
 }
 
-// DELETE tipizzato.
-export async function apiDelete<T = unknown>(path: string): Promise<T> {
+// DELETE tipizzato con body JSON opzionale.
+// Senza body (default): comportamento INVARIATO — solo header Accept, nessun body —
+// così i chiamanti esistenti (es. apiDelete('/api/...')) non cambiano.
+// Con body: aggiunge Content-Type: application/json e serializza il body, come apiPost
+// (serve a regia deleteDrink → DELETE /api/regia/drink { p_drink }, che legge il JSON).
+export async function apiDelete<T = unknown>(path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method: 'DELETE',
     credentials: 'include',
-    headers: { Accept: 'application/json' },
+    headers:
+      body === undefined
+        ? { Accept: 'application/json' }
+        : { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!res.ok) throw await errorFromResponse(res);
   return parseOk<T>(res);

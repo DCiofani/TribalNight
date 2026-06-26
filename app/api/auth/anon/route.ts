@@ -10,7 +10,7 @@
 //   /api/auth/anon e ottiene un nuovo sub. Il guestId reale (puntatore NON segreto) è già
 //   persistito client-side in lib/guest-session.ts e ri-associato via register_guest,
 //   quindi una nuova identità anonima non perde la riga guests finché il guestId è noto.
-//   Evitiamo così di riempire auth.refresh_tokens di token usa-e-getta. (Se in futuro
+//   Evitiamo così di riempire app_auth.refresh_tokens di token usa-e-getta. (Se in futuro
 //   servisse continuità più lunga, basta emettere anche un refresh con issueRefresh(sub)
 //   e settare il cookie tn_rt — rotateRefresh già gestisce role=null.)
 //

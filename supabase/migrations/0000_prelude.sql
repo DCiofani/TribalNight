@@ -87,11 +87,11 @@ $$;
 -- Idempotente: GRANT role TO role è no-op se la membership esiste già.
 --
 -- LEAST PRIVILEGE: service_role NON è concesso ad authenticator. Il canale di
--- servizio (auth.* , seed/admin, bypassrls) è raggiungibile SOLO dalla connessione
+-- servizio (app_auth.* , seed/admin, bypassrls) è raggiungibile SOLO dalla connessione
 -- di servizio dedicata (AUTH_DB_URL / DATABASE_URL_DIRECT, ruolo owner/service),
 -- mai dal pool runtime del backend che si connette come authenticator. Così, anche
 -- se il path `authenticated` fosse forzato, non potrebbe escalare a service_role né
--- leggere auth.staff_users / auth.refresh_tokens.
+-- leggere app_auth.staff_users / app_auth.refresh_tokens.
 grant anon, authenticated to authenticator;
 
 -- search_path stabile per le sessioni `authenticated`: con pgbouncer in
