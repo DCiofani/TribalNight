@@ -9,6 +9,7 @@ import { useRouter } from 'next/navigation';
 import { Screen, Card, Button, Stat } from '@/components/ui';
 import Totem from '@/components/Totem';
 import { createClient } from '@/lib/supabase/client';
+import { USE_API } from '@/lib/backend-mode';
 import { registerGuest, RpcError } from '@/lib/rpc';
 import { saveGuestId } from '@/lib/guest-session';
 
@@ -30,16 +31,37 @@ export default function OnboardingPage() {
     setErrore(null);
 
     try {
+      // Istanza supabase usata SOLO nel path supabase. In API mode registerGuest
+      // ignora il client (parla col backend via fetch), ma la teniamo per mantenere
+      // la firma del wrapper invariata e non toccare il resto del flusso.
       const supabase = createClient();
 
-      // Sessione anonima idempotente: firma solo se assente.
-      const { data: sessionData } = await supabase.auth.getSession();
-      if (!sessionData.session) {
-        const { error: authErr } = await supabase.auth.signInAnonymously();
-        if (authErr) throw authErr;
+      if (USE_API) {
+        // Path API (backend nuovo): identità anonima emessa dal server con cookie
+        // di sessione HttpOnly. POST /api/auth/anon -> { sub }; il cookie viaggia
+        // grazie a credentials:'include'. Idempotenza non necessaria: una seconda
+        // identità anonima non perde la riga guests finché il guestId è persistito.
+        const res = await fetch('/api/auth/anon', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { Accept: 'application/json' },
+        });
+        if (!res.ok) {
+          throw new RpcError('Sign-in anonimo non riuscito', {
+            code: String(res.status),
+          });
+        }
+      } else {
+        // Path supabase (default): sessione anonima idempotente, firma solo se assente.
+        const { data: sessionData } = await supabase.auth.getSession();
+        if (!sessionData.session) {
+          const { error: authErr } = await supabase.auth.signInAnonymously();
+          if (authErr) throw authErr;
+        }
       }
 
       // register_guest risolve l'evento corrente internamente (current_event()).
+      // Wrapper unico: in API mode chiama POST /api/guest/register, altrimenti la RPC.
       const guest = await registerGuest(supabase, nome);
 
       // Persisti SOLO l'id (puntatore). PIN/saldi NON vanno in localStorage.

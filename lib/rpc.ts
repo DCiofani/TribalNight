@@ -1,8 +1,15 @@
 // Wrapper RPC tipizzati. UNICO punto da cui il client scrive.
 // Niente ricalcolo: il front-end chiama la RPC e legge il risultato/Realtime.
 // NB: NIENTE 'server-only' — questi wrapper girano nel browser con la anon key.
+//
+// Fase 3 (strangler, feature-flagged): ogni wrapper fa
+//   if (USE_API) { fetch /api } else { supabase-js come oggi }.
+// Il path supabase resta INVARIATO; le firme pubbliche NON cambiano (le pagine non si
+// toccano). NON importiamo lib/db né lib/auth-server (server-only): l'API si parla via lib/api.
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { getCurrentEventId } from '@/lib/events';
+import { USE_API } from '@/lib/backend-mode';
+import { apiGet, apiPost } from '@/lib/api';
 
 // Shape parziale della riga public.guests usata dal front-end (lettura, mai calcolo).
 export type GuestRow = {
@@ -19,7 +26,7 @@ export type GuestRow = {
 
 export type TipoConsumazione = 'normale' | 'premium';
 
-// Errore applicativo uniforme: nasconde la differenza PostgREST/Supabase
+// Errore applicativo uniforme: nasconde la differenza PostgREST/Supabase/route /api
 // e porta un messaggio leggibile + il codice per i casi gestibili a UI.
 export class RpcError extends Error {
   code?: string;
@@ -53,10 +60,30 @@ function rethrow(error: {
 // register_guest -> riga guests dell'ospite (con la propria sessione).
 // Risolve l'evento corrente via current_event() (deploy evento singolo): il client
 // non passa mai event_id a mano. Precondizione: sessione attiva (anche anonima).
+//
+// Branch USE_API:
+//   - API: POST /api/guest/register { p_nome } → riga guests. La route risolve l'evento
+//     server-side (current_event()); se non c'è evento risponde 400 { error: 'nessun
+//     evento attivo' } → la rilanciamo come RpcError(code 'NO_EVENT') per parità col path
+//     supabase (la pagina onboarding discrimina su err.code === 'NO_EVENT').
+//   - supabase (INVARIATO): risolve l'evento via getCurrentEventId, poi rpc register_guest.
 export async function registerGuest(
   supabase: SupabaseClient,
   nome: string,
 ): Promise<GuestRow> {
+  if (USE_API) {
+    try {
+      return await apiPost<GuestRow>('/api/guest/register', { p_nome: nome.trim() });
+    } catch (err) {
+      // Nessun evento attivo: la route ritorna 400 con questo messaggio. Normalizziamo
+      // il code su 'NO_EVENT' così la UI esistente continua a riconoscere il caso.
+      if (err instanceof RpcError && /nessun evento/i.test(err.message)) {
+        throw new RpcError('Nessun evento attivo', { code: 'NO_EVENT' });
+      }
+      throw err;
+    }
+  }
+
   const eventId = await getCurrentEventId(supabase);
   if (!eventId) {
     throw new RpcError('Nessun evento attivo', { code: 'NO_EVENT' });
@@ -74,6 +101,12 @@ export async function registerGuest(
 // idem NON raddoppia il saldo (la RPC ritorna la transazione già scritta).
 // Richiede sessione staff con ruolo cassa (gating server-side via RLS/claim).
 // Il saldo aggiornato arriva via Realtime su guests: qui NON si ricalcola nulla.
+//
+// Branch USE_API:
+//   - API: POST /api/cassa/topup { p_guest, p_tipo, p_qta, p_importo, p_idem }.
+//     Il gate ruolo cassa/admin è server-side; l'errore di saldo/permesso torna come
+//     RpcError dal body { error }.
+//   - supabase (INVARIATO): rpc topup.
 export async function topup(
   supabase: SupabaseClient,
   args: {
@@ -84,6 +117,16 @@ export async function topup(
     idem?: string; // default crypto.randomUUID(); passa un valore stabile per retry sicuri
   },
 ): Promise<unknown> {
+  if (USE_API) {
+    return apiPost<unknown>('/api/cassa/topup', {
+      p_guest: args.guestId,
+      p_tipo: args.tipo,
+      p_qta: args.qta,
+      p_importo: args.importo,
+      p_idem: args.idem ?? crypto.randomUUID(),
+    });
+  }
+
   const { data, error } = await supabase.rpc('topup', {
     p_guest: args.guestId,
     p_tipo: args.tipo,
@@ -101,11 +144,27 @@ export async function topup(
 // Sola lettura: nessun ricalcolo client-side. eventId è passato esplicito (la pagina lo ha
 // già da getCurrentEventId) per evitare una RPC current_event() ad ogni tentativo.
 // maybeSingle() -> null se PIN inesistente (UI: "ospite non trovato", non errore).
+//
+// Branch USE_API:
+//   - API: GET /api/cassa/guest?pin=XXXX → riga guests (l'event_id è risolto server-side via
+//     current_event(), quindi il parametro eventId qui è ignorato — la firma resta invariata
+//     per non toccare le pagine). 404 { error } = PIN inesistente → null (non un errore).
+//   - supabase (INVARIATO): select diretta su guests filtrata event_id+pin.
 export async function lookupGuestByPin(
   supabase: SupabaseClient,
   eventId: string,
   pin: string,
 ): Promise<GuestRow | null> {
+  if (USE_API) {
+    try {
+      return await apiGet<GuestRow>(`/api/cassa/guest?pin=${encodeURIComponent(pin)}`);
+    } catch (err) {
+      // 404 = ospite non trovato: stesso significato del maybeSingle()→null supabase.
+      if (err instanceof RpcError && err.code === '404') return null;
+      throw err;
+    }
+  }
+
   const { data, error } = await supabase
     .from('guests')
     .select(
