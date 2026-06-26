@@ -54,8 +54,12 @@ jobs:
       - run: npm ci
       - name: Prelude (shim ruoli + auth)
         run: psql "$DB" -v ON_ERROR_STOP=1 -f supabase/ci/prelude.sql
-      - name: Apply migration (clean)
-        run: psql "$DB" -v ON_ERROR_STOP=1 -f supabase/migrations/0001_init.sql
+      - name: Apply migrations (clean, in ordine)
+        run: |
+          for f in supabase/migrations/*.sql; do
+            echo "── applying $f"
+            psql "$DB" -v ON_ERROR_STOP=1 -f "$f"
+          done
       - name: Assert contratto v0.2
         run: psql "$DB" -v ON_ERROR_STOP=1 -f supabase/ci/assert.sql
       - name: Contract/RLS/idempotenza test (M1-S2, esecuzione reale)

@@ -47,7 +47,12 @@ Tutte le modifiche rilevanti a **Totem Night**. Formato: [Keep a Changelog](http
 - ✅ **E2E reale VERDE contro Railway** (anon sign-in → register_guest → topup staff → RLS → idempotenza). Account staff `cassa@totem.local` (role `cassa`) creato.
 - 🔐 Secret (JWT secret, service key, DB password, staff pw) vivono nelle **variabili Railway** = fonte di verità; **da ruotare** prima del go-live pubblico.
 
-_(prossimo: M1-S3 cassa `topup` UI con login staff, poi M2 `consume`)_
+### Infra review (multi-agente) + hardening
+- Report `docs/design/railway-infra-review.md` (5 lenti + sintesi). Verdetto: **funziona ma non ottimale as-is** (11 servizi per 6 usati, mai load-testato). Rischi serata: auto-deploy attivo, no backup, tap-burst non testato. Self-host ok per 1° evento.
+- **Fix GDPR applicato**: `supabase/migrations/0002_draws_select_staff.sql` — `draws_select` da `using(true)` a `using(is_staff())` (gli anon non scaricano più nomi+ticket della platea dopo l'estrazione). Applicato al Postgres Railway + CI ora applica tutte le migrazioni in ordine.
+- ⏳ Da fare (review): taglio 5 servizi morti (Storage/S3/Imgproxy/Studio/PG-Meta) + verifica regione EU — **bloccati da Railway OAuth flaky** (MCP/CLI Unauthorized); da dashboard o al ripristino auth. Pre-evento: freeze auto-deploy, pg_dump loop, load-test tap in staging, throttle tap cumulativo (M3).
+
+_(prossimo: M2 `consume`; pre-evento: quick wins infra rimanenti)_
 
 ## [0.1.0] — 2026-06-24 — M1-S1 Fondamenta
 
