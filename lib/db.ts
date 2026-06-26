@@ -29,22 +29,24 @@ import { Pool, type PoolClient, type QueryResult, type QueryResultRow } from 'pg
 // non deve MAI finire nel bundle client.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const connectionString = process.env.DATABASE_URL;
-if (!connectionString) {
-  throw new Error(
-    'DATABASE_URL non impostata: il backend si connette come `authenticator` ' +
-      '(es. postgres://authenticator:...@pgbouncer:6432/...).',
-  );
-}
-
-// Pool singleton. In dev, Next ricompila e ricarica i moduli ad ogni edit: senza
-// cache si accumulerebbero pool (e connessioni) ad ogni HMR. Lo memoizziamo sul
-// globalThis. `max` va tenuto <= alla capacità lato client di pgbouncer.
+// Pool singleton LAZY. NON va creato (né DATABASE_URL validata) a import-time:
+// `next build` importa i moduli delle route per leggerne la config → un throw qui
+// romperebbe il build statico (che non ha né deve avere creds DB). Il pool si crea
+// alla PRIMA query e fallisce solo allora se DATABASE_URL manca (runtime).
+// In dev Next ricarica i moduli ad ogni HMR: memoizziamo su globalThis per non
+// accumulare pool/connessioni. `max` <= capacità lato client di pgbouncer.
 const globalForPool = globalThis as unknown as { __totemPgPool?: Pool };
 
-export const pool: Pool =
-  globalForPool.__totemPgPool ??
-  new Pool({
+function getPool(): Pool {
+  if (globalForPool.__totemPgPool) return globalForPool.__totemPgPool;
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error(
+      'DATABASE_URL non impostata: il backend si connette come `authenticator` ' +
+        '(es. postgres://authenticator:...@pgbouncer:6432/...).',
+    );
+  }
+  const pool = new Pool({
     connectionString,
     max: Number(process.env.PG_POOL_MAX ?? 10),
     // Le tx sono corte e a singola istruzione: un cap basso protegge da query
@@ -53,9 +55,8 @@ export const pool: Pool =
     statement_timeout: Number(process.env.PG_STATEMENT_TIMEOUT_MS ?? 15000),
     idleTimeoutMillis: 30000,
   });
-
-if (process.env.NODE_ENV !== 'production') {
   globalForPool.__totemPgPool = pool;
+  return pool;
 }
 
 // Forma minima dei claims accettati da withAuth. Volutamente lasca su app_metadata
@@ -80,7 +81,7 @@ export async function withAuth<T>(
   claims: AuthClaims,
   fn: (client: PoolClient) => Promise<T>,
 ): Promise<T> {
-  const client = await pool.connect();
+  const client = await getPool().connect();
   try {
     await client.query('begin');
     await client.query('set local role authenticated');
@@ -112,5 +113,5 @@ export async function query<R extends QueryResultRow = QueryResultRow>(
   text: string,
   params?: ReadonlyArray<unknown>,
 ): Promise<QueryResult<R>> {
-  return pool.query<R>(text, params as unknown[] | undefined);
+  return getPool().query<R>(text, params as unknown[] | undefined);
 }
