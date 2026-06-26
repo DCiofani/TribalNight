@@ -6,6 +6,14 @@ Tutte le modifiche rilevanti a **Totem Night**. Formato: [Keep a Changelog](http
 
 ## [Unreleased]
 
+### Migrazione Supabase → Postgres/Next — Fase 0+1 (auth propria) ✅
+- **Fase 0 (fondamenta DB):** `supabase/migrations/0000_prelude.sql` — promosso da shim CI a migrazione prod (ruoli anon/authenticated/service_role/**authenticator** + schema `auth.uid/role/jwt`); lo schema `0001` resta invariato. `lib/db.ts` `withAuth(claims, fn)` (= `tests/db.mjs::actAs` con commit; `set local role authenticated` + `set_config(request.jwt.claims)` → pgbouncer-safe).
+- **Fase 1 (auth propria, sostituisce GoTrue):** `0003_auth.sql` (`auth.staff_users` + `auth.refresh_tokens`); `lib/auth-server/*` — JWT HS256 (`jose`, audience+clockTolerance), password **argon2id**, refresh **opaco hashato con rotazione + reuse-detection kill-all**, `service-db` dedicato (fail-fast, mai authenticator), guard `requireRole`; endpoint `/api/auth/{anon,login,refresh,logout,me}` (cookie HttpOnly+Secure+SameSite=Strict, CSRF Sec-Fetch-Site/Origin).
+- Generato via Workflow multi-agente; **review applicata** (2 critical schema↔codice + high security: dummy-hash argon2 runtime, refresh-reuse kill-all, IP rate-limit, least-privilege authenticator, SameSite Strict). Fix in extra: `replaced_by` uuid (insert `returning id`).
+- ✅ **Verificato reale:** migrazioni `0000→0003` clean su Postgres puro + **30/30 contract test verdi** (nucleo migra 1:1); auth runtime su PG locale: anon/login/me/refresh-rotation/401-pw-errata/**reuse→kill-all** tutti ok. build/lint/typecheck verdi.
+- Strangler: codice NUOVO accanto a Supabase (ancora live, non wired al client). Deps: +`jose`+`argon2`+`server-only`, `pg`→dependencies.
+- _(prossimo: Fase 2 — 14 RPC come API routes; Fase 3 cutover client; Fase 4 realtime SSE; Fase 5 deploy Railway + spegni Supabase)_
+
 ### Added
 - **Schermate temporanee swappabili** (in attesa del design definitivo da Claude Design), generate e revisionate via Workflow multi-agente:
   - Layer primitivi UI token-driven: `components/ui/{Screen,Card,Button,Stat,index}` + barrel.
