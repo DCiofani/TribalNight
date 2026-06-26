@@ -30,14 +30,24 @@ Tutte le modifiche rilevanti a **Totem Night**. Formato: [Keep a Changelog](http
   - `lib/guest-session.ts`: persistenza `guestId` (localStorage, SSR-safe).
 - `/onboarding` cablato: anonymous sign-in → `register_guest` (`current_event`) → salva guestId → `/guest`. `/guest` mostra dati LIVE (no mock, no ricalcolo client).
 - `supabase/config.toml` (stack locale `supabase start`, anonymous sign-in abilitato).
+- **Cassa cablata** (Workflow multi-agente): `lib/auth.ts` (login staff `signInWithPassword` + `getSessionRole` + `isStaffRole`), `lib/rpc.ts` `lookupGuestByPin` (SELECT diretta, RLS staff), `app/cassa/page.tsx` flusso completo: gate ruolo → login staff → lookup ospite per PIN → Totem+saldi live → ricarica via `topup` con **idem stabile** (`idemRef`, retry-safe anti doppio-addebito) → re-fetch realtime. Consuma resta TODO(M2).
 
 ### Testing (M1-S3)
 - **E2E REALE** `tests/e2e_supabase.test.mjs` (supabase-js contro Supabase locale): admin crea utente staff `cassa` → ospite anon sign-in → `register_guest` → `topup` (cassa) → ospite rilegge saldo via RLS → **idempotenza** (stesso idem non raddoppia). Skip pulito se env assente.
 - ✅ **30/30 test verdi** su Supabase locale reale (29 contract/RLS DB + 1 e2e full-path). Build/lint/typecheck verdi.
 - ✅ **Verifica browser**: onboarding → /guest live (guest creato nel DB, saldi/ticket/totem reali via `useGuestState`), zero errori console.
-- Nota CI: l'e2e fa skip in CI (nessuno stack Supabase nel runner); i 29 contract/RLS girano su Postgres effimero. L'e2e è un gate locale (`supabase start`).
+- **E2E cassa** `tests/cassa_e2e.test.mjs`: login staff → lookup per PIN (RLS staff) → `topup` premium → rilettura saldo + caso negativo (ospite non-staff NON vede il PIN altrui). ✅ verde su stack locale.
+- Nota CI: gli e2e Supabase fanno skip in CI (nessuno stack nel runner); i 29 contract/RLS girano su Postgres effimero. Gli e2e sono gate locale (`supabase start`) / verificati anche contro Railway.
 
-_(prossimo: M1-S3 cassa `topup` UI con login staff, poi M2 bar loop `consume`)_
+### Deploy / Infra (tutto su Railway — niente vendor esterno)
+- **App `web`** (progetto Railway TotemNight / Uledia): repo `DCiofani/TribalNight` branch `main`, **auto-deploy on push**, Nixpacks; dominio `https://web-production-2df81.up.railway.app`.
+- **Supabase self-hosted su Railway** (template `supabase`): servizi Kong, Gotrue Auth, PostgREST, Realtime, Postgres (volume), Storage, Studio, Postgres-Meta. Bootstrap secret completato (JWT secret unico + anon/service key generati e propagati a tutti i servizi; `GOTRUE_SITE_URL` + anonymous sign-in ON). API pubblica: `https://kong-production-1e5e.up.railway.app`.
+- Migrazione **v0.2 applicata** al Postgres self-hosted + evento `Totem Night` (APERTA) + 3 drink seed.
+- `web` puntato al Kong (`NEXT_PUBLIC_SUPABASE_URL`/`ANON_KEY` inlinati a build-time, verificato nel bundle).
+- ✅ **E2E reale VERDE contro Railway** (anon sign-in → register_guest → topup staff → RLS → idempotenza). Account staff `cassa@totem.local` (role `cassa`) creato.
+- 🔐 Secret (JWT secret, service key, DB password, staff pw) vivono nelle **variabili Railway** = fonte di verità; **da ruotare** prima del go-live pubblico.
+
+_(prossimo: M1-S3 cassa `topup` UI con login staff, poi M2 `consume`)_
 
 ## [0.1.0] — 2026-06-24 — M1-S1 Fondamenta
 

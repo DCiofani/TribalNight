@@ -94,3 +94,26 @@ export async function topup(
   if (error) rethrow(error);
   return data; // riga transactions
 }
+
+// lookupGuestByPin -> riga guests dell'ospite col PIN dato, o null se non esiste.
+// SELECT DIRETTA (non RPC): consentita allo staff dalla policy RLS guests_select (is_staff).
+// Lookup MIRATO (un solo PIN per volta, filtrato su event_id+pin): non espone l'elenco PIN.
+// Sola lettura: nessun ricalcolo client-side. eventId è passato esplicito (la pagina lo ha
+// già da getCurrentEventId) per evitare una RPC current_event() ad ogni tentativo.
+// maybeSingle() -> null se PIN inesistente (UI: "ospite non trovato", non errore).
+export async function lookupGuestByPin(
+  supabase: SupabaseClient,
+  eventId: string,
+  pin: string,
+): Promise<GuestRow | null> {
+  const { data, error } = await supabase
+    .from('guests')
+    .select(
+      'id, event_id, nome, pin, saldo_normale, saldo_premium, ticket_totali, consumazioni_count, livello_totem',
+    )
+    .eq('event_id', eventId)
+    .eq('pin', pin)
+    .maybeSingle();
+  if (error) rethrow(error);
+  return (data as GuestRow | null) ?? null;
+}
