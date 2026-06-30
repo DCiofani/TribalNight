@@ -26,6 +26,29 @@ export type GuestRow = {
 
 export type TipoConsumazione = 'normale' | 'premium';
 
+// Shape della riga public.drinks usata dal front-end (lettura menù/cassa, mai calcolo).
+// Colonne reali da supabase/migrations/0001_init.sql, tabella public.drinks.
+export type DrinkRow = {
+  id: string;
+  event_id: string;
+  nome: string;
+  tipo: TipoConsumazione; // 'normale' | 'premium' (check lato DB)
+  descrizione: string | null; // testo per il menù
+  categoria: string | null; // es. Cocktail, Birre, Analcolici
+  immagine_url: string | null;
+  ordine: number; // ordinamento nel menù
+  visibile: boolean; // mostrato nel menù dell'ospite
+  attivo: boolean; // ordinabile alla cassa
+};
+
+// Statistiche evento aggregate per la regia (sola lettura, calcolate dal DB via RPC).
+export type EventStats = {
+  fase: string;
+  presenze: number;
+  gettoni_venduti: number;
+  ticket_totali: number;
+};
+
 // Errore applicativo uniforme: nasconde la differenza PostgREST/Supabase/route /api
 // e porta un messaggio leggibile + il codice per i casi gestibili a UI.
 export class RpcError extends Error {
@@ -273,4 +296,53 @@ export async function lookupGuestByPin(
     .maybeSingle();
   if (error) rethrow(error);
   return (data as GuestRow | null) ?? null;
+}
+
+// listDrinks -> elenco drink ATTIVI dell'evento, ordinati per `ordine` (per il menù/cassa).
+// Sola lettura: nessun ricalcolo client-side. Filtra attivo=true e ordina lato DB.
+//
+// Branch USE_API:
+//   - API: GET /api/regia/drink?event=<id> → DrinkRow[] (gate ruolo cassa/regia/admin
+//     server-side; il filtro attivo/ordinamento è nella route).
+//   - supabase (INVARIATO): select diretta su drinks filtrata event_id+attivo, order ordine.
+export async function listDrinks(
+  supabase: SupabaseClient,
+  args: { eventId: string },
+): Promise<DrinkRow[]> {
+  if (USE_API) {
+    return apiGet<DrinkRow[]>(`/api/regia/drink?event=${encodeURIComponent(args.eventId)}`);
+  }
+
+  const { data, error } = await supabase
+    .from('drinks')
+    .select(
+      'id, event_id, nome, tipo, descrizione, categoria, immagine_url, ordine, visibile, attivo',
+    )
+    .eq('event_id', args.eventId)
+    .eq('attivo', true)
+    .order('ordine');
+  if (error) rethrow(error);
+  return (data as DrinkRow[] | null) ?? [];
+}
+
+// getEventStats -> statistiche aggregate dell'evento per la regia (fase, presenze,
+// gettoni venduti, ticket totali). Sola lettura: i conteggi sono calcolati dal DB (RPC
+// event_stats), il client non somma nulla. Gate: staff (regia/admin) lato DB/route.
+//
+// Branch USE_API:
+//   - API: GET /api/regia/stats?event=<id> → EventStats (gate ruolo regia/admin server-side).
+//   - supabase (INVARIATO): rpc event_stats(p_event) → prima (unica) riga.
+export async function getEventStats(
+  supabase: SupabaseClient,
+  args: { eventId: string },
+): Promise<EventStats> {
+  if (USE_API) {
+    return apiGet<EventStats>(`/api/regia/stats?event=${encodeURIComponent(args.eventId)}`);
+  }
+
+  const { data, error } = await supabase.rpc('event_stats', { p_event: args.eventId });
+  if (error) rethrow(error);
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row) throw new RpcError('event_stats non ha restituito statistiche');
+  return row as EventStats;
 }

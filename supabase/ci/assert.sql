@@ -20,7 +20,8 @@ declare
     'public.upsert_drink(uuid,uuid,text,text,text,text,text,int,boolean,boolean)',
     'public.set_drink_visibility(uuid,boolean)',
     'public.set_drink_active(uuid,boolean)',
-    'public.delete_drink(uuid)'
+    'public.delete_drink(uuid)',
+    'public.event_stats(uuid)'
   ];
 begin
   foreach rpc in array rpcs loop

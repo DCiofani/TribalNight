@@ -19,8 +19,8 @@ import {
   isStaffRole,
   signOut,
 } from '@/lib/auth';
-import { lookupGuestByPin, topup, RpcError } from '@/lib/rpc';
-import type { TipoConsumazione } from '@/lib/rpc';
+import { lookupGuestByPin, topup, consume, listDrinks, RpcError } from '@/lib/rpc';
+import type { TipoConsumazione, DrinkRow } from '@/lib/rpc';
 
 // Stile condiviso degli input (token CSS, niente hex hardcoded).
 const inputStyle: React.CSSProperties = {
@@ -59,6 +59,10 @@ export default function CassaPage() {
   const [lookupError, setLookupError] = useState<string | null>(null);
   const [guestId, setGuestId] = useState<string | null>(null);
   const [guestNome, setGuestNome] = useState<string | null>(null);
+  // Evento corrente risolto durante il lookup: lo TENGO in stato (oltre a usarlo
+  // localmente in handleLookup) così l'useEffect del listino drink ha una chiave su cui
+  // ri-fetchare. Resta deploy a evento singolo: lo ricavo da getCurrentEventId, non a mano.
+  const [eventId, setEventId] = useState<string | null>(null);
 
   // ── Fase E — ricarica ───────────────────────────────────────────────────
   const [tipo, setTipo] = useState<TipoConsumazione>('normale');
@@ -67,6 +71,23 @@ export default function CassaPage() {
   const [topupBusy, setTopupBusy] = useState(false);
   const [topupError, setTopupError] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
+
+  // ── Fase F — consumo al bar (§7.3) ──────────────────────────────────────
+  // Listino drink dell'evento (sola lettura, popolato via listDrinks): nessun
+  // calcolo client. Il drink scelto guida il consumo; il tipo è già nella DrinkRow,
+  // quindi NON serve scegliere normale/premium qui (lo fa il drink).
+  const [drinks, setDrinks] = useState<DrinkRow[]>([]);
+  const [drinkSelezionato, setDrinkSelezionato] = useState<string | null>(null);
+  const [consumeBusy, setConsumeBusy] = useState(false);
+  const [consumeError, setConsumeError] = useState<string | null>(null);
+  const [consumeFeedback, setConsumeFeedback] = useState<string | null>(null);
+
+  // p_idem STABILE per il consumo in corso (gemello di idemRef del topup): generato alla
+  // scelta del drink e RIUSATO finché il consumo non va a buon fine. Un doppio-tap / retry
+  // di rete ritenta con lo STESSO idem → la RPC ritorna la consumazione già scritta, NON
+  // scala due volte il saldo. Azzerato su: (i) successo, (ii) cambio drink, (iii) cambio
+  // ospite / resetGuest. NB: lo schema vuole p_idem di tipo uuid → randomUUID().
+  const consumeIdemRef = useRef<string | null>(null);
 
   // p_idem STABILE per la ricarica in corso: generato una volta e RIUSATO finché la
   // ricarica non va a buon fine. Così un doppio-submit (StrictMode, doppio tap, retry
@@ -95,6 +116,29 @@ export default function CassaPage() {
   }, [supabase]);
 
   const staff = isStaffRole(role);
+
+  // Carica il listino drink quando conosco l'evento (ricavato nel flusso lookup).
+  // listDrinks filtra già attivo=true e ordina per `ordine` lato wrapper: qui mi limito
+  // a popolare lo stato (sola lettura). Niente evento → svuoto il listino.
+  useEffect(() => {
+    if (!eventId) {
+      setDrinks([]);
+      return;
+    }
+    let active = true;
+    void (async () => {
+      try {
+        const rows = await listDrinks(supabase, { eventId });
+        if (active) setDrinks(rows);
+      } catch {
+        // Listino non disponibile: lascio drinks vuoto → il picker mostra lo stato vuoto.
+        if (active) setDrinks([]);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [supabase, eventId]);
 
   // ── Handlers ────────────────────────────────────────────────────────────
 
@@ -130,12 +174,14 @@ export default function CassaPage() {
     setFeedback(null);
     setTopupError(null);
     try {
-      const eventId = await getCurrentEventId(supabase);
-      if (!eventId) {
+      const currentEventId = await getCurrentEventId(supabase);
+      if (!currentEventId) {
         setLookupError('Nessun evento attivo');
         return;
       }
-      const g = await lookupGuestByPin(supabase, eventId, pin);
+      // Conservo l'evento in stato: serve all'useEffect del listino drink.
+      setEventId(currentEventId);
+      const g = await lookupGuestByPin(supabase, currentEventId, pin);
       if (!g) {
         setLookupError('Ospite non trovato');
         setGuestId(null);
@@ -162,6 +208,11 @@ export default function CassaPage() {
     setImporto(0);
     setTipo('normale');
     idemRef.current = null; // nuovo ospite → nuova idem alla prossima conferma
+    // Reset del pannello consumo (il listino drink resta: è dell'evento, non dell'ospite).
+    setDrinkSelezionato(null);
+    setConsumeError(null);
+    setConsumeFeedback(null);
+    consumeIdemRef.current = null; // nuovo ospite → nuova idem al prossimo consumo
   }
 
   async function handleEsci() {
@@ -208,6 +259,48 @@ export default function CassaPage() {
       }
     } finally {
       setTopupBusy(false);
+    }
+  }
+
+  // Scelta drink: imposta il drink e (ri)genera l'idem stabile del consumo. Cambiare drink
+  // INVALIDA l'idem in attesa — un retry NON deve mai applicare un consumo a un drink diverso.
+  function selectDrink(drinkId: string) {
+    setDrinkSelezionato(drinkId);
+    setConsumeError(null);
+    setConsumeFeedback(null);
+    consumeIdemRef.current = crypto.randomUUID();
+  }
+
+  async function handleConsume(e: React.FormEvent) {
+    e.preventDefault();
+    if (!guestId || !drinkSelezionato) return;
+    setConsumeBusy(true);
+    setConsumeError(null);
+    setConsumeFeedback(null);
+    // p_idem STABILE per questo consumo: generato alla scelta del drink e riusato finché non
+    // va a buon fine. Un retry (doppio tap / errore di rete) ritenta con lo STESSO idem → la
+    // RPC ritorna la consumazione già scritta, NON scala due volte il saldo.
+    if (!consumeIdemRef.current) consumeIdemRef.current = crypto.randomUUID();
+    try {
+      await consume(supabase, {
+        guestId,
+        drinkId: drinkSelezionato,
+        idem: consumeIdemRef.current,
+      });
+      // Successo: butta via l'idem e deseleziona così il prossimo consumo parte pulito.
+      consumeIdemRef.current = null;
+      setDrinkSelezionato(null);
+      // NON tocco i saldi: useGuestState li riallinea via realtime/refetch.
+      setConsumeFeedback('Consumo registrato');
+    } catch (err) {
+      // Errore → MANTENGO consumeIdemRef.current: ritentare lo stesso consumo è sicuro.
+      if (err instanceof RpcError) {
+        setConsumeError(err.message);
+      } else {
+        setConsumeError(err instanceof Error ? err.message : 'Errore consumo');
+      }
+    } finally {
+      setConsumeBusy(false);
     }
   }
 
@@ -517,15 +610,61 @@ export default function CassaPage() {
             </form>
           </Card>
 
-          {/* ── Consuma — TODO(M2): nessun cablaggio consumo in M1-S3. ──────── */}
+          {/* ── Fase F — pannello Consuma (§7.3) ───────────────────────────── */}
           <Card style={{ marginTop: 16 }}>
             <p className="tag" style={{ margin: 0 }}>Consuma — §7.3</p>
             <p style={{ margin: '6px 0 12px', color: 'var(--ink-300)', fontSize: 14 }}>
               Seleziona il drink dal listino: il saldo del tipo corrispondente scala
-              di 1 (bloccato se a 0).
+              di 1 (bloccato se a 0). Il saldo aggiornato arriva dal server.
             </p>
-            {/* TODO(M2 consume): transaction(consumo) → saldo--, ticket via RPC. */}
-            <Button disabled>Conferma consumo (TODO M2)</Button>
+
+            <form onSubmit={handleConsume}>
+              <p className="tag" style={labelStyle}>Drink</p>
+              {drinks.length === 0 ? (
+                <p style={{ margin: 0, color: 'var(--ink-300)', fontSize: 14 }}>
+                  Nessun drink disponibile.
+                </p>
+              ) : (
+                <div
+                  role="radiogroup"
+                  aria-label="Drink da consumare"
+                  style={{ display: 'grid', gap: 8 }}
+                >
+                  {drinks.map((d) => (
+                    <Button
+                      key={d.id}
+                      variant={drinkSelezionato === d.id ? 'primary' : 'ghost'}
+                      onClick={() => selectDrink(d.id)}
+                    >
+                      {d.nome} · {d.tipo}
+                    </Button>
+                  ))}
+                </div>
+              )}
+
+              {consumeError && (
+                <p style={{ margin: '12px 0 0', color: 'var(--ember)', fontSize: 14 }}>
+                  {consumeError}
+                </p>
+              )}
+              {consumeFeedback && (
+                <p
+                  style={{
+                    margin: '12px 0 0',
+                    color: 'var(--eden-lavender)',
+                    fontSize: 14,
+                  }}
+                >
+                  {consumeFeedback}
+                </p>
+              )}
+
+              <div style={{ marginTop: 16 }}>
+                <Button type="submit" disabled={consumeBusy || !drinkSelezionato}>
+                  {consumeBusy ? 'Registrazione…' : 'Conferma consumo'}
+                </Button>
+              </div>
+            </form>
           </Card>
         </>
       )}

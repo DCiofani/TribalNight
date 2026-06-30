@@ -10,6 +10,7 @@ import 'server-only';
 import { NextResponse } from 'next/server';
 import { withAuth, type AuthClaims } from '@/lib/db';
 import { requireRole } from '@/lib/auth-server/guard';
+import { isValidUuid } from '@/lib/auth-server/claims';
 import { handleError, readJson, sameOriginOk } from '../../_lib';
 
 export const runtime = 'nodejs';
@@ -27,6 +28,38 @@ type UpsertBody = {
   p_visibile?: boolean | null;
   p_attivo?: boolean | null;
 };
+
+// GET /api/regia/drink?event=<uuid> → DrinkRow[] (voci attive, ordinate).
+// Lettura staff (cassa/regia/admin); le colonne combaciano con DrinkRow in lib/rpc.ts.
+// La policy drinks_select autorizza già la SELECT (is_staff() vede anche non visibili).
+export async function GET(req: Request): Promise<NextResponse> {
+  if (!sameOriginOk(req)) return NextResponse.json({ error: 'forbidden' }, { status: 403 });
+  try {
+    const claims = await requireRole(req, ['cassa', 'regia', 'admin']);
+
+    const eventId = new URL(req.url).searchParams.get('event');
+    if (!isValidUuid(eventId)) {
+      return NextResponse.json({ error: 'event id non valido' }, { status: 400 });
+    }
+
+    const rows = await withAuth(claims as AuthClaims, (c) =>
+      c
+        .query(
+          `select id, event_id, nome, tipo, descrizione, categoria,
+                  immagine_url, ordine, visibile, attivo
+             from public.drinks
+            where event_id = $1 and attivo
+            order by ordine`,
+          [eventId],
+        )
+        .then((r) => r.rows),
+    );
+
+    return NextResponse.json(rows);
+  } catch (err) {
+    return handleError(err);
+  }
+}
 
 export async function POST(req: Request): Promise<NextResponse> {
   if (!sameOriginOk(req)) return NextResponse.json({ error: 'forbidden' }, { status: 403 });
