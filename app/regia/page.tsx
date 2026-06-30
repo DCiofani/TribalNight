@@ -31,8 +31,24 @@ import {
   staffSignIn,
   signOut,
 } from '@/lib/auth';
-import { getEventStats, RpcError, type EventStats } from '@/lib/rpc';
-import { setPhase, startSession, runDraw, type Phase } from '@/lib/regia';
+import {
+  getEventStats,
+  listAllDrinks,
+  RpcError,
+  type EventStats,
+  type DrinkRow,
+  type TipoConsumazione,
+} from '@/lib/rpc';
+import {
+  setPhase,
+  startSession,
+  runDraw,
+  upsertDrink,
+  deleteDrink,
+  setDrinkVisibility,
+  setDrinkActive,
+  type Phase,
+} from '@/lib/regia';
 
 // Fasi del flusso serata (spec §10). Ordine/labels per l'indicatore e i controlli;
 // la fase REALE arriva da stats.fase (server-authoritative), mai dedotta dal client.
@@ -95,6 +111,23 @@ export default function RegiaPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
 
+  // ── Gestione menù (CRUD listino) ────────────────────────────────────────
+  // drinks: TUTTE le voci (anche non visibili/non attive) via listAllDrinks. SOLA
+  // LETTURA: la lista è server-authoritative, qui non si filtra/ordina/conteggia nulla.
+  const [drinks, setDrinks] = useState<DrinkRow[]>([]);
+  const [drinksError, setDrinksError] = useState<string | null>(null);
+  const [menuBusy, setMenuBusy] = useState<string | null>(null); // key azione menù
+  const [menuError, setMenuError] = useState<string | null>(null);
+  const [menuFeedback, setMenuFeedback] = useState<string | null>(null);
+
+  // Form crea/modifica. editingId === null → insert; valorizzato → update di quella voce.
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [formNome, setFormNome] = useState('');
+  const [formTipo, setFormTipo] = useState<TipoConsumazione>('normale');
+  const [formDescrizione, setFormDescrizione] = useState('');
+  const [formCategoria, setFormCategoria] = useState('');
+  const [formOrdine, setFormOrdine] = useState('0');
+
   const staff = isStaffRole(role) && (role === 'regia' || role === 'admin');
 
   // Ref alla funzione di fetch stats per usarla dentro lo stream/polling senza
@@ -114,6 +147,22 @@ export default function RegiaPage() {
     } catch (err) {
       setStatsError(
         err instanceof Error ? err.message : 'Statistiche non disponibili',
+      );
+    }
+  }
+
+  // Fetch autoritativo del listino COMPLETO (anche non visibili/non attivi) per la
+  // gestione menù. SOLA LETTURA: la lista arriva dal server, qui non si filtra né ordina.
+  async function refetchDrinks() {
+    const id = eventIdRef.current;
+    if (!id) return;
+    try {
+      const rows = await listAllDrinks(supabase, { eventId: id });
+      setDrinks(rows);
+      setDrinksError(null);
+    } catch (err) {
+      setDrinksError(
+        err instanceof Error ? err.message : 'Listino non disponibile',
       );
     }
   }
@@ -226,6 +275,53 @@ export default function RegiaPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [staff, eventId]);
 
+  // ── Gestione menù: fetch iniziale del listino + LIVE via SSE drinks. ──────
+  // Carica la lista completa quando eventId è noto. In USE_API ascolta
+  // EventSource('/api/stream/drinks?event=…'): ad ogni segnale 'drinks' RIFETCH la
+  // lista (il payload è solo un trigger, non la verità). Niente polling: in path
+  // supabase la lista si riallinea comunque dopo ogni mutazione (vedi runMenuAction).
+  useEffect(() => {
+    if (!staff || !eventId) return;
+    let active = true;
+
+    void refetchDrinks();
+
+    if (USE_API && typeof EventSource !== 'undefined') {
+      let es: EventSource | null = null;
+      try {
+        es = new EventSource(
+          '/api/stream/drinks?event=' + encodeURIComponent(eventId),
+          { withCredentials: true },
+        );
+      } catch {
+        es = null;
+      }
+
+      if (es) {
+        const onDrinks = () => {
+          if (!active) return;
+          void refetchDrinks();
+        };
+        es.onopen = () => {
+          if (!active) return;
+          void refetchDrinks();
+        };
+        es.addEventListener('drinks', onDrinks as EventListener);
+
+        return () => {
+          active = false;
+          es?.removeEventListener('drinks', onDrinks as EventListener);
+          es?.close();
+        };
+      }
+    }
+
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [staff, eventId]);
+
   // ── Handlers ────────────────────────────────────────────────────────────
 
   async function handleLogin(e: React.FormEvent) {
@@ -261,6 +357,11 @@ export default function RegiaPage() {
     setStatsError(null);
     setActionError(null);
     setFeedback(null);
+    setDrinks([]);
+    setDrinksError(null);
+    setMenuError(null);
+    setMenuFeedback(null);
+    resetMenuForm();
     setEmail('');
     setPassword('');
   }
@@ -315,6 +416,117 @@ export default function RegiaPage() {
       },
       'Estrazione eseguita',
     );
+  }
+
+  // ── Handlers gestione menù ───────────────────────────────────────────────
+
+  // Esegue una mutazione del listino (key = id azione per il busy puntuale), poi
+  // RIFETCH la lista completa. NESSUNA mutazione manuale dello stato `drinks` oltre al
+  // refetch: la verità torna sempre dal server (coerente con SSE in USE_API).
+  // Ritorna true a buon fine, false su errore: i chiamanti (submit/delete) usano l'esito
+  // per decidere se resettare il form, senza dipendere da una promise che non rigetta mai.
+  async function runMenuAction(
+    key: string,
+    fn: () => Promise<unknown>,
+    ok: string,
+  ): Promise<boolean> {
+    if (!eventId) return false;
+    setMenuBusy(key);
+    setMenuError(null);
+    setMenuFeedback(null);
+    try {
+      await fn();
+      setMenuFeedback(ok);
+      await refetchDrinks();
+      return true;
+    } catch (err) {
+      if (err instanceof RpcError) {
+        setMenuError(err.message);
+      } else {
+        setMenuError(err instanceof Error ? err.message : 'Operazione fallita');
+      }
+      return false;
+    } finally {
+      setMenuBusy(null);
+    }
+  }
+
+  function resetMenuForm() {
+    setEditingId(null);
+    setFormNome('');
+    setFormTipo('normale');
+    setFormDescrizione('');
+    setFormCategoria('');
+    setFormOrdine('0');
+  }
+
+  // Precarica il form coi valori di una voce esistente → upsertDrink la aggiornerà.
+  function handleEditDrink(d: DrinkRow) {
+    setEditingId(d.id);
+    setFormNome(d.nome);
+    setFormTipo(d.tipo);
+    setFormDescrizione(d.descrizione ?? '');
+    setFormCategoria(d.categoria ?? '');
+    setFormOrdine(String(d.ordine));
+    setMenuError(null);
+    setMenuFeedback(null);
+  }
+
+  function handleSubmitDrink(e: React.FormEvent) {
+    e.preventDefault();
+    const nome = formNome.trim();
+    if (!nome) {
+      setMenuError('Il nome è obbligatorio');
+      return;
+    }
+    // ordine: il client NON ricalcola nulla, normalizza solo l'input numerico del form.
+    const ordineParsed = Number.parseInt(formOrdine, 10);
+    const ordine = Number.isFinite(ordineParsed) ? ordineParsed : 0;
+    const id = editingId; // insert se null, update se valorizzato
+    void runMenuAction(
+      id ? 'edit:' + id : 'create',
+      () =>
+        upsertDrink(supabase, {
+          eventId: eventId as string,
+          id,
+          nome,
+          tipo: formTipo,
+          descrizione: formDescrizione.trim() || null,
+          categoria: formCategoria.trim() || null,
+          ordine,
+        }),
+      id ? 'Voce aggiornata' : 'Voce creata',
+    ).then((ok) => {
+      // reset del form solo a buon fine (su errore lascia i campi per ritentare).
+      if (ok) resetMenuForm();
+    });
+  }
+
+  function handleToggleVisible(d: DrinkRow) {
+    void runMenuAction(
+      'visible:' + d.id,
+      () => setDrinkVisibility(supabase, { drinkId: d.id, visibile: !d.visibile }),
+      d.visibile ? 'Voce nascosta' : 'Voce resa visibile',
+    );
+  }
+
+  function handleToggleActive(d: DrinkRow) {
+    void runMenuAction(
+      'active:' + d.id,
+      () => setDrinkActive(supabase, { drinkId: d.id, attivo: !d.attivo }),
+      d.attivo ? 'Voce disattivata' : 'Voce attivata',
+    );
+  }
+
+  function handleDeleteDrink(d: DrinkRow) {
+    void runMenuAction(
+      'delete:' + d.id,
+      () => deleteDrink(supabase, { drinkId: d.id }),
+      'Voce eliminata',
+    ).then((ok) => {
+      // se stavo editando proprio questa voce, esci dalla modalità modifica.
+      if (ok && editingId === d.id) resetMenuForm();
+    });
   }
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -563,6 +775,229 @@ export default function RegiaPage() {
             {feedback}
           </p>
         )}
+      </Card>
+
+      {/* ── Gestione menù — CRUD listino. Tutte le scritture via wrapper regia; la lista
+            è server-authoritative (listAllDrinks), MAI filtrata/ordinata/contata qui. ── */}
+      <Card
+        style={{
+          marginTop: 16,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 12,
+        }}
+      >
+        <p className="tag">Gestione menù</p>
+
+        {/* Form crea/modifica — insert se nuova, update se sto editando una voce. */}
+        <form onSubmit={handleSubmitDrink}>
+          <label htmlFor="drink-nome" className="tag" style={labelStyle}>
+            Nome
+          </label>
+          <input
+            id="drink-nome"
+            type="text"
+            placeholder="Mojito"
+            value={formNome}
+            onChange={(e) => setFormNome(e.target.value)}
+            style={inputStyle}
+          />
+
+          <label
+            htmlFor="drink-tipo"
+            className="tag"
+            style={{ ...labelStyle, marginTop: 12 }}
+          >
+            Tipo
+          </label>
+          <select
+            id="drink-tipo"
+            value={formTipo}
+            onChange={(e) => setFormTipo(e.target.value as TipoConsumazione)}
+            style={inputStyle}
+          >
+            <option value="normale">Normale</option>
+            <option value="premium">Premium</option>
+          </select>
+
+          <label
+            htmlFor="drink-descrizione"
+            className="tag"
+            style={{ ...labelStyle, marginTop: 12 }}
+          >
+            Descrizione
+          </label>
+          <input
+            id="drink-descrizione"
+            type="text"
+            placeholder="Rum, lime, menta, zucchero"
+            value={formDescrizione}
+            onChange={(e) => setFormDescrizione(e.target.value)}
+            style={inputStyle}
+          />
+
+          <label
+            htmlFor="drink-categoria"
+            className="tag"
+            style={{ ...labelStyle, marginTop: 12 }}
+          >
+            Categoria
+          </label>
+          <input
+            id="drink-categoria"
+            type="text"
+            placeholder="Cocktail"
+            value={formCategoria}
+            onChange={(e) => setFormCategoria(e.target.value)}
+            style={inputStyle}
+          />
+
+          <label
+            htmlFor="drink-ordine"
+            className="tag"
+            style={{ ...labelStyle, marginTop: 12 }}
+          >
+            Ordine
+          </label>
+          <input
+            id="drink-ordine"
+            type="number"
+            inputMode="numeric"
+            value={formOrdine}
+            onChange={(e) => setFormOrdine(e.target.value)}
+            style={inputStyle}
+          />
+
+          <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
+            <Button
+              type="submit"
+              variant="primary"
+              disabled={!eventId || menuBusy !== null}
+            >
+              {menuBusy === 'create' || (editingId && menuBusy === 'edit:' + editingId)
+                ? 'Salvataggio…'
+                : editingId
+                  ? 'Aggiorna voce'
+                  : 'Crea voce'}
+            </Button>
+            {editingId && (
+              <Button
+                type="button"
+                variant="ghost"
+                disabled={menuBusy !== null}
+                onClick={resetMenuForm}
+              >
+                Annulla modifica
+              </Button>
+            )}
+          </div>
+        </form>
+
+        {menuError && (
+          <p style={{ margin: '4px 0 0', color: 'var(--ember)', fontSize: 14 }}>
+            {menuError}
+          </p>
+        )}
+        {menuFeedback && (
+          <p style={{ margin: '4px 0 0', color: 'var(--eden-lavender)', fontSize: 14 }}>
+            {menuFeedback}
+          </p>
+        )}
+
+        {/* Lista voci — ogni riga: nome/tipo/ordine + toggle Visibile/Attivo separati +
+            Modifica/Elimina. Conteggi e ordine così come arrivano dal server. */}
+        <p className="tag" style={{ marginTop: 4 }}>
+          Voci del listino
+        </p>
+
+        {drinksError && (
+          <p style={{ margin: 0, color: 'var(--ember)', fontSize: 14 }}>
+            Listino non disponibile: {drinksError}
+          </p>
+        )}
+
+        {!drinksError && drinks.length === 0 && (
+          <p style={{ margin: 0, color: 'var(--ink-300)', fontSize: 14 }}>
+            Nessuna voce nel listino.
+          </p>
+        )}
+
+        <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {drinks.map((d) => (
+            <li
+              key={d.id}
+              style={{
+                border: '1px solid var(--night-700)',
+                borderRadius: 12,
+                padding: 12,
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 8,
+              }}
+            >
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'baseline',
+                  gap: 8,
+                }}
+              >
+                <span style={{ fontWeight: 700, color: 'var(--ink-0)' }}>{d.nome}</span>
+                <span className="tag" style={{ flexShrink: 0 }}>
+                  {d.tipo} · ord. {d.ordine}
+                </span>
+              </div>
+
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                <div style={{ flex: '1 1 30%', minWidth: 110 }}>
+                  <Button
+                    variant={d.visibile ? 'primary' : 'ghost'}
+                    disabled={menuBusy !== null}
+                    onClick={() => handleToggleVisible(d)}
+                  >
+                    {menuBusy === 'visible:' + d.id
+                      ? '…'
+                      : d.visibile
+                        ? 'Visibile ✓'
+                        : 'Visibile ✕'}
+                  </Button>
+                </div>
+                <div style={{ flex: '1 1 30%', minWidth: 110 }}>
+                  <Button
+                    variant={d.attivo ? 'primary' : 'ghost'}
+                    disabled={menuBusy !== null}
+                    onClick={() => handleToggleActive(d)}
+                  >
+                    {menuBusy === 'active:' + d.id
+                      ? '…'
+                      : d.attivo
+                        ? 'Attivo ✓'
+                        : 'Attivo ✕'}
+                  </Button>
+                </div>
+                <div style={{ flex: '1 1 30%', minWidth: 110 }}>
+                  <Button
+                    variant="ghost"
+                    disabled={menuBusy !== null}
+                    onClick={() => handleEditDrink(d)}
+                  >
+                    Modifica
+                  </Button>
+                </div>
+                <div style={{ flex: '1 1 30%', minWidth: 110 }}>
+                  <Button
+                    variant="ghost"
+                    disabled={menuBusy !== null}
+                    onClick={() => handleDeleteDrink(d)}
+                  >
+                    {menuBusy === 'delete:' + d.id ? 'Elimino…' : 'Elimina'}
+                  </Button>
+                </div>
+              </div>
+            </li>
+          ))}
+        </ul>
       </Card>
     </Screen>
   );

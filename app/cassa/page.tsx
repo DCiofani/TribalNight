@@ -11,8 +11,9 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Screen, Card, Button, Stat } from '@/components/ui';
 import Totem from '@/components/Totem';
 import { createClient } from '@/lib/supabase/client';
-import { getCurrentEventId } from '@/lib/events';
+import { getCurrentEventId, getCurrentEventState } from '@/lib/events';
 import { useGuestState } from '@/lib/useGuestState';
+import { USE_API } from '@/lib/backend-mode';
 import {
   staffSignIn,
   getSessionRole,
@@ -39,6 +40,26 @@ const labelStyle: React.CSSProperties = {
   marginBottom: 8,
 };
 
+// Estrae in modo DIFENSIVO l'esito ricco dal valore restituito dalla RPC consume
+// (riga public.transactions: tipo_consumazione + ticket_delta). Il wrapper tipizza il
+// ritorno come `unknown` e il path /api potrebbe non restituire la riga: qui leggo i
+// campi solo se presenti e del tipo atteso, altrimenti null. NESSUN calcolo: sono i
+// valori scritti dal DB, non derivati a mano.
+function extractConsumeEsito(res: unknown): {
+  tipo: TipoConsumazione | null;
+  ticket: number | null;
+} {
+  // La RPC ritorna una singola riga, ma il path /api potrebbe wrapparla in array.
+  const row = (Array.isArray(res) ? res[0] : res) as Record<string, unknown> | null;
+  if (!row || typeof row !== 'object') return { tipo: null, ticket: null };
+  const rawTipo = row.tipo_consumazione;
+  const tipo: TipoConsumazione | null =
+    rawTipo === 'normale' || rawTipo === 'premium' ? rawTipo : null;
+  const rawTicket = row.ticket_delta;
+  const ticket = typeof rawTicket === 'number' ? rawTicket : null;
+  return { tipo, ticket };
+}
+
 export default function CassaPage() {
   // Istanza supabase singola e stabile per tutta la vita della pagina.
   const supabase = useMemo(() => createClient(), []);
@@ -64,6 +85,18 @@ export default function CassaPage() {
   // ri-fetchare. Resta deploy a evento singolo: lo ricavo da getCurrentEventId, non a mano.
   const [eventId, setEventId] = useState<string | null>(null);
 
+  // Fase dell'evento (autoritativa dal DB via getCurrentEventState): SOLO per il gating
+  // UX. Il gate reale resta server-side — le RPC topup/consume rifiutano comunque fuori
+  // da APERTA (vedi raise 'ricariche disabilitate'/'bar non operativo' nello schema). Qui
+  // disabilitiamo i bottoni in anticipo per evitare tentativi inutili e dare un messaggio.
+  const [fase, setFase] = useState<string | null>(null);
+  // Gating UX: blocco i bottoni SOLO quando conosco una fase ≠ APERTA. Con fase ancora
+  // null (non risolta / non leggibile) NON blocco: il gate autoritativo resta la RPC
+  // (rifiuta fuori da APERTA), quindi un blocco ottimistico su null negherebbe operazioni
+  // legittime senza guadagno di sicurezza.
+  const barChiuso = fase !== null && fase !== 'APERTA';
+  const barOperativo = !barChiuso;
+
   // ── Fase E — ricarica ───────────────────────────────────────────────────
   const [tipo, setTipo] = useState<TipoConsumazione>('normale');
   const [qta, setQta] = useState<number>(1);
@@ -81,6 +114,14 @@ export default function CassaPage() {
   const [consumeBusy, setConsumeBusy] = useState(false);
   const [consumeError, setConsumeError] = useState<string | null>(null);
   const [consumeFeedback, setConsumeFeedback] = useState<string | null>(null);
+  // Esito ricco dell'ultimo consumo, ricavato dal valore restituito dalla RPC consume
+  // (riga transactions): il tipo consumato e i ticket assegnati (ticket_delta). NON è un
+  // calcolo client: sono i valori scritti dal DB. Il nuovo saldo del tipo NON è nel
+  // ritorno → lo leggo dal saldo vivo di useGuestState (sotto), mai ricalcolato a mano.
+  const [consumeEsito, setConsumeEsito] = useState<{
+    tipo: TipoConsumazione | null;
+    ticket: number | null;
+  } | null>(null);
 
   // p_idem STABILE per il consumo in corso (gemello di idemRef del topup): generato alla
   // scelta del drink e RIUSATO finché il consumo non va a buon fine. Un doppio-tap / retry
@@ -101,6 +142,19 @@ export default function CassaPage() {
   // a mano → l'hook si riallinea via realtime/refetch (unico punto di verità).
   const guest = useGuestState(guestId);
 
+  // Listino diviso in due sezioni per il picker: "Normali" e "Premium", raggruppando per
+  // d.tipo. `drinks` arriva già ordinato per `ordine` da listDrinks (lato DB/wrapper): il
+  // filter PRESERVA quell'ordine, quindi ogni sezione resta ordinata per ordine. NESSUN
+  // ricalcolo di dominio: è solo una partizione presentazionale della lista server.
+  const drinksNormali = useMemo(
+    () => drinks.filter((d) => d.tipo === 'normale'),
+    [drinks],
+  );
+  const drinksPremium = useMemo(
+    () => drinks.filter((d) => d.tipo === 'premium'),
+    [drinks],
+  );
+
   // Gate iniziale: leggi il ruolo della sessione (se esiste) al mount.
   useEffect(() => {
     let active = true;
@@ -117,22 +171,89 @@ export default function CassaPage() {
 
   const staff = isStaffRole(role);
 
-  // Carica il listino drink quando conosco l'evento (ricavato nel flusso lookup).
-  // listDrinks filtra già attivo=true e ordina per `ordine` lato wrapper: qui mi limito
-  // a popolare lo stato (sola lettura). Niente evento → svuoto il listino.
+  // Carica il listino drink quando conosco l'evento (ricavato nel flusso lookup) e, su
+  // path USE_API, lo tiene VIVO via SSE. listDrinks filtra già attivo=true e ordina per
+  // `ordine` lato wrapper: qui mi limito a popolare lo stato (sola lettura). Niente evento
+  // → svuoto il listino.
+  //
+  // REALTIME (solo USE_API, simmetria con regia/useGuestState): apro EventSource su
+  // '/api/stream/drinks?event=<id>'. L'evento SSE 'drinks' è un puro SEGNALE "qualcosa è
+  // cambiato" (nessun dato di catalogo nel payload): alla ricezione RILEGGO la lista via
+  // listDrinks (refetch autoritativo RLS-scoped). Sul path supabase (o EventSource non
+  // disponibile) resta solo il fetch iniziale, senza polling.
   useEffect(() => {
     if (!eventId) {
       setDrinks([]);
       return;
     }
     let active = true;
-    void (async () => {
+
+    const refetchDrinks = async () => {
       try {
         const rows = await listDrinks(supabase, { eventId });
         if (active) setDrinks(rows);
       } catch {
         // Listino non disponibile: lascio drinks vuoto → il picker mostra lo stato vuoto.
         if (active) setDrinks([]);
+      }
+    };
+
+    // Fetch iniziale (entrambi i path).
+    void refetchDrinks();
+
+    // Realtime via SSE solo sul backend nuovo.
+    if (USE_API && typeof EventSource !== 'undefined') {
+      let es: EventSource | null = null;
+      try {
+        es = new EventSource(
+          '/api/stream/drinks?event=' + encodeURIComponent(eventId),
+          { withCredentials: true },
+        );
+      } catch {
+        es = null;
+      }
+
+      if (es) {
+        // 'drinks' = segnale → rileggi il listino (mai dati nel payload).
+        const onDrinks = () => {
+          if (!active) return;
+          void refetchDrinks();
+        };
+        es.addEventListener('drinks', onDrinks as EventListener);
+        return () => {
+          active = false;
+          es?.removeEventListener('drinks', onDrinks as EventListener);
+          es?.close();
+        };
+      }
+      // EventSource non costruibile: resta il solo fetch iniziale.
+    }
+
+    return () => {
+      active = false;
+    };
+  }, [supabase, eventId]);
+
+  // Fase dell'evento corrente (autoritativa dal DB) per il gating UX. Risolta quando
+  // conosco l'evento (cioè al lookup / cambio ospite). È best-effort: la fase è gestita
+  // dalla regia e qui non la sottoscriviamo in realtime, quindi il valore può restare
+  // momentaneamente indietro rispetto a un cambio fase fatto altrove. Va bene: il gate
+  // AUTORITATIVO resta comunque server-side nelle RPC (rifiutano fuori da APERTA), questo
+  // è solo per disabilitare i bottoni e dare un messaggio. Niente polling aggiuntivo qui.
+  useEffect(() => {
+    if (!eventId) {
+      setFase(null);
+      return;
+    }
+    let active = true;
+    void (async () => {
+      try {
+        const st = await getCurrentEventState(supabase);
+        if (active) setFase(st?.fase ?? null);
+      } catch {
+        // Fase non leggibile: lascio null → il gating resta prudente (vedi nota sotto) ma
+        // le RPC restano la difesa reale.
+        if (active) setFase(null);
       }
     })();
     return () => {
@@ -212,6 +333,7 @@ export default function CassaPage() {
     setDrinkSelezionato(null);
     setConsumeError(null);
     setConsumeFeedback(null);
+    setConsumeEsito(null);
     consumeIdemRef.current = null; // nuovo ospite → nuova idem al prossimo consumo
   }
 
@@ -268,6 +390,7 @@ export default function CassaPage() {
     setDrinkSelezionato(drinkId);
     setConsumeError(null);
     setConsumeFeedback(null);
+    setConsumeEsito(null);
     consumeIdemRef.current = crypto.randomUUID();
   }
 
@@ -282,7 +405,7 @@ export default function CassaPage() {
     // RPC ritorna la consumazione già scritta, NON scala due volte il saldo.
     if (!consumeIdemRef.current) consumeIdemRef.current = crypto.randomUUID();
     try {
-      await consume(supabase, {
+      const res = await consume(supabase, {
         guestId,
         drinkId: drinkSelezionato,
         idem: consumeIdemRef.current,
@@ -292,6 +415,11 @@ export default function CassaPage() {
       setDrinkSelezionato(null);
       // NON tocco i saldi: useGuestState li riallinea via realtime/refetch.
       setConsumeFeedback('Consumo registrato');
+      // Feedback ricco dal VALORE RESTITUITO dalla RPC (riga transactions): leggo il tipo
+      // consumato e i ticket assegnati (ticket_delta). Lettura difensiva: la firma del
+      // wrapper è `unknown` e il path /api potrebbe non restituire la riga → in tal caso
+      // i campi restano null e mostro solo il saldo vivo (mai un calcolo a mano).
+      setConsumeEsito(extractConsumeEsito(res));
     } catch (err) {
       // Errore → MANTENGO consumeIdemRef.current: ritentare lo stesso consumo è sicuro.
       if (err instanceof RpcError) {
@@ -481,6 +609,18 @@ export default function CassaPage() {
             </div>
           </Card>
 
+          {/* Gating fase (UX): se l'evento NON è APERTA segnalo che il bar non opera e
+              disabilito i bottoni topup/consume sotto. Il gate AUTORITATIVO resta lato
+              server (le RPC rifiutano comunque fuori da APERTA). */}
+          {barChiuso && (
+            <Card style={{ marginTop: 16, borderColor: 'var(--ember)' }}>
+              <p className="tag" style={{ margin: 0 }}>Fase {fase}</p>
+              <p style={{ margin: '6px 0 0', color: 'var(--ink-300)', fontSize: 14 }}>
+                Bar operativo solo in APERTA — ricariche e consumi sono disabilitati.
+              </p>
+            </Card>
+          )}
+
           <div
             style={{ display: 'flex', justifyContent: 'center', margin: '20px 0 8px' }}
           >
@@ -602,8 +742,16 @@ export default function CassaPage() {
                 </p>
               )}
 
+              {/* Gating UX: fuori da APERTA disabilito + spiego perché (il gate reale è
+                  comunque server-side nella RPC topup). */}
+              {barChiuso && (
+                <p style={{ margin: '12px 0 0', color: 'var(--ember)', fontSize: 14 }}>
+                  Bar operativo solo in APERTA.
+                </p>
+              )}
+
               <div style={{ marginTop: 16 }}>
-                <Button type="submit" disabled={topupBusy}>
+                <Button type="submit" disabled={topupBusy || !barOperativo}>
                   {topupBusy ? 'Registrazione…' : 'Conferma ricarica'}
                 </Button>
               </div>
@@ -619,27 +767,65 @@ export default function CassaPage() {
             </p>
 
             <form onSubmit={handleConsume}>
-              <p className="tag" style={labelStyle}>Drink</p>
+              {/* Listino in DUE sezioni raggruppate per tipo: "Normali" e "Premium".
+                  Ogni sezione è ordinata per `ordine` (eredita l'ordinamento di
+                  listDrinks). I bottoni sono disabilitati fuori da APERTA (gate UX). */}
               {drinks.length === 0 ? (
                 <p style={{ margin: 0, color: 'var(--ink-300)', fontSize: 14 }}>
                   Nessun drink disponibile.
                 </p>
               ) : (
-                <div
-                  role="radiogroup"
-                  aria-label="Drink da consumare"
-                  style={{ display: 'grid', gap: 8 }}
-                >
-                  {drinks.map((d) => (
-                    <Button
-                      key={d.id}
-                      variant={drinkSelezionato === d.id ? 'primary' : 'ghost'}
-                      onClick={() => selectDrink(d.id)}
+                <>
+                  <p className="tag" style={labelStyle}>Normali</p>
+                  {drinksNormali.length === 0 ? (
+                    <p style={{ margin: 0, color: 'var(--ink-300)', fontSize: 14 }}>
+                      Nessun drink normale.
+                    </p>
+                  ) : (
+                    <div
+                      role="radiogroup"
+                      aria-label="Drink normali da consumare"
+                      style={{ display: 'grid', gap: 8 }}
                     >
-                      {d.nome} · {d.tipo}
-                    </Button>
-                  ))}
-                </div>
+                      {drinksNormali.map((d) => (
+                        <Button
+                          key={d.id}
+                          variant={drinkSelezionato === d.id ? 'primary' : 'ghost'}
+                          disabled={!barOperativo}
+                          onClick={() => selectDrink(d.id)}
+                        >
+                          {d.nome}
+                        </Button>
+                      ))}
+                    </div>
+                  )}
+
+                  <p className="tag" style={{ ...labelStyle, marginTop: 16 }}>
+                    Premium
+                  </p>
+                  {drinksPremium.length === 0 ? (
+                    <p style={{ margin: 0, color: 'var(--ink-300)', fontSize: 14 }}>
+                      Nessun drink premium.
+                    </p>
+                  ) : (
+                    <div
+                      role="radiogroup"
+                      aria-label="Drink premium da consumare"
+                      style={{ display: 'grid', gap: 8 }}
+                    >
+                      {drinksPremium.map((d) => (
+                        <Button
+                          key={d.id}
+                          variant={drinkSelezionato === d.id ? 'primary' : 'ghost'}
+                          disabled={!barOperativo}
+                          onClick={() => selectDrink(d.id)}
+                        >
+                          {d.nome}
+                        </Button>
+                      ))}
+                    </div>
+                  )}
+                </>
               )}
 
               {consumeError && (
@@ -648,19 +834,51 @@ export default function CassaPage() {
                 </p>
               )}
               {consumeFeedback && (
-                <p
-                  style={{
-                    margin: '12px 0 0',
-                    color: 'var(--eden-lavender)',
-                    fontSize: 14,
-                  }}
-                >
-                  {consumeFeedback}
+                <div style={{ margin: '12px 0 0' }}>
+                  <p
+                    style={{
+                      margin: 0,
+                      color: 'var(--eden-lavender)',
+                      fontSize: 14,
+                      fontWeight: 700,
+                    }}
+                  >
+                    {consumeFeedback}
+                  </p>
+                  {/* Esito ricco: ticket assegnati dal valore RESTITUITO dalla RPC
+                      (ticket_delta) + nuovo saldo del tipo consumato dal saldo VIVO di
+                      useGuestState (mai ricalcolato a mano). Mostro ogni riga solo se il
+                      dato è disponibile. */}
+                  {consumeEsito?.ticket != null && (
+                    <p style={{ margin: '4px 0 0', color: 'var(--ink-300)', fontSize: 14 }}>
+                      Ticket assegnati: <strong>{consumeEsito.ticket}</strong>
+                    </p>
+                  )}
+                  {consumeEsito?.tipo != null && (
+                    <p style={{ margin: '4px 0 0', color: 'var(--ink-300)', fontSize: 14 }}>
+                      Nuovo saldo {consumeEsito.tipo}:{' '}
+                      <strong>
+                        {(consumeEsito.tipo === 'normale'
+                          ? guest.saldoNormale
+                          : guest.saldoPremium) ?? '—'}
+                      </strong>
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {/* Gating UX: fuori da APERTA disabilito (il gate reale è server-side). */}
+              {barChiuso && (
+                <p style={{ margin: '12px 0 0', color: 'var(--ember)', fontSize: 14 }}>
+                  Bar operativo solo in APERTA.
                 </p>
               )}
 
               <div style={{ marginTop: 16 }}>
-                <Button type="submit" disabled={consumeBusy || !drinkSelezionato}>
+                <Button
+                  type="submit"
+                  disabled={consumeBusy || !drinkSelezionato || !barOperativo}
+                >
                   {consumeBusy ? 'Registrazione…' : 'Conferma consumo'}
                 </Button>
               </div>
