@@ -138,6 +138,104 @@ export async function topup(
   return data; // riga transactions
 }
 
+// consume(...) -> consumo al bar: -1 sul saldo del tipo del drink, +1 ticket.
+// Idempotente su p_idem: ritentare con LO STESSO idem NON scala due volte il saldo
+// (la RPC ritorna la consumazione già scritta). Gate server-side: sessione staff con
+// ruolo cassa/admin (via RLS/claim). Il saldo aggiornato arriva via Realtime su guests:
+// qui NON si ricalcola nulla lato client.
+//
+// Branch USE_API:
+//   - API: POST /api/cassa/consume { p_guest, p_drink, p_idem }. Il gate ruolo cassa/admin
+//     è server-side; l'errore di saldo/permesso torna come RpcError dal body { error }.
+//   - supabase (INVARIATO): rpc consume.
+export async function consume(
+  supabase: SupabaseClient,
+  args: {
+    guestId: string;
+    drinkId: string;
+    idem?: string; // default crypto.randomUUID(); passa un valore stabile per retry sicuri
+  },
+): Promise<unknown> {
+  if (USE_API) {
+    return apiPost<unknown>('/api/cassa/consume', {
+      p_guest: args.guestId,
+      p_drink: args.drinkId,
+      p_idem: args.idem ?? crypto.randomUUID(),
+    });
+  }
+
+  const { data, error } = await supabase.rpc('consume', {
+    p_guest: args.guestId,
+    p_drink: args.drinkId,
+    p_idem: args.idem ?? crypto.randomUUID(),
+  });
+  if (error) rethrow(error);
+  return data;
+}
+
+// registerTaps(...) -> registra il conteggio tap CUMULATIVO della sessione (NON un delta:
+// il client invia il totale corrente, il DB non somma). Gate: requireAuth (ospite). p_count
+// è un int4 in [0, 2147483647]. Il livello totem aggiornato arriva via Realtime su guests:
+// qui NON si ricalcola nulla lato client.
+//
+// Branch USE_API:
+//   - API: POST /api/tap { p_session, p_count }. Il gate ospite (requireAuth) è server-side;
+//     l'errore di permesso/validazione torna come RpcError dal body { error }.
+//   - supabase (INVARIATO): rpc register_taps.
+export async function registerTaps(
+  supabase: SupabaseClient,
+  args: {
+    sessionId: string;
+    count: number; // conteggio cumulativo, int4 [0, 2147483647]
+  },
+): Promise<unknown> {
+  if (USE_API) {
+    return apiPost<unknown>('/api/tap', {
+      p_session: args.sessionId,
+      p_count: args.count,
+    });
+  }
+
+  const { data, error } = await supabase.rpc('register_taps', {
+    p_session: args.sessionId,
+    p_count: args.count,
+  });
+  if (error) rethrow(error);
+  return data;
+}
+
+// convertCredit(...) -> conversione finale credito -> ticket (fase LAST_CALL).
+// Idempotente su p_idem: ritentare con LO STESSO idem NON converte due volte
+// (la RPC ritorna la conversione già scritta). Gate self-or-staff: l'ospite può convertire
+// il proprio credito, lo staff quello altrui (verificato nel DB). Il saldo/ticket aggiornato
+// arriva via Realtime su guests: qui NON si ricalcola nulla lato client.
+//
+// Branch USE_API:
+//   - API: POST /api/credit/convert { p_guest, p_idem }. Il gate self-or-staff è server-side;
+//     l'errore di permesso/fase torna come RpcError dal body { error }.
+//   - supabase (INVARIATO): rpc convert_credit.
+export async function convertCredit(
+  supabase: SupabaseClient,
+  args: {
+    guestId: string;
+    idem?: string; // default crypto.randomUUID(); passa un valore stabile per retry sicuri
+  },
+): Promise<unknown> {
+  if (USE_API) {
+    return apiPost<unknown>('/api/credit/convert', {
+      p_guest: args.guestId,
+      p_idem: args.idem ?? crypto.randomUUID(),
+    });
+  }
+
+  const { data, error } = await supabase.rpc('convert_credit', {
+    p_guest: args.guestId,
+    p_idem: args.idem ?? crypto.randomUUID(),
+  });
+  if (error) rethrow(error);
+  return data;
+}
+
 // lookupGuestByPin -> riga guests dell'ospite col PIN dato, o null se non esiste.
 // SELECT DIRETTA (non RPC): consentita allo staff dalla policy RLS guests_select (is_staff).
 // Lookup MIRATO (un solo PIN per volta, filtrato su event_id+pin): non espone l'elenco PIN.
