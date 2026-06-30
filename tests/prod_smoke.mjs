@@ -15,6 +15,8 @@ import assert from 'node:assert/strict';
 
 const BASE = process.env.BASE ?? 'https://web-production-2df81.up.railway.app';
 const STAFF_EMAIL = process.env.STAFF_EMAIL ?? 'cassa@totem.local';
+const REGIA_EMAIL = process.env.REGIA_EMAIL ?? 'regia@totem.local';
+const REGIA_PW = process.env.REGIA_PW; // opt-in: abilita i check M2/M3 (regia/drink/stats/stream/consumo)
 const STAFF_PW = process.env.STAFF_PW;
 if (!STAFF_PW) {
   console.log('SKIP prod_smoke: STAFF_PW non impostata (smoke su ambiente live, opt-in).');
@@ -90,4 +92,54 @@ assert.ok([401, 403].includes(r.status), 'cassa→draw vietato (' + r.status + '
 r = await fetch(BASE + '/api/credit/convert', { method: 'POST', headers: { ...H(gc), 'content-type': 'application/json' }, body: JSON.stringify({ p_guest: guest.id }) });
 assert.ok([200, 400].includes(r.status), 'convert raggiungibile (' + r.status + ')'); ok('convert: route+auth OK (' + r.status + (r.status === 400 ? ', phase-guard' : ', eseguito') + ')');
 
-console.log('\nRISULTATO: ' + pass + '/14 PASS — ' + BASE + ' (Postgres + Next + auth propria)');
+// ── M2/M3 (opt-in REGIA_PW): regia + lista drink + stats + consumo reale ──────────────
+// NON muta la FASE evento (niente set_phase/run_draw su live); tocca solo il guest usa-e-getta.
+if (REGIA_PW) {
+  const ct = (c) => ({ ...H(c), 'content-type': 'application/json' });
+
+  r = await fetch(BASE + '/api/auth/login', { method: 'POST', headers: ct(), body: JSON.stringify({ email: REGIA_EMAIL, password: REGIA_PW }) });
+  assert.equal(r.status, 200, 'login regia 200'); const rc = jget(r);
+  const meR = await fetch(BASE + '/api/auth/me', { headers: H(rc) }).then((x) => x.json());
+  assert.equal(meR.role, 'regia', 'role regia'); ok('M2/M3: login regia');
+
+  r = await fetch(BASE + '/api/regia/drink?event=' + ev, { headers: H(sc) });
+  assert.equal(r.status, 200, 'drink 200'); const drinks = await r.json();
+  assert.ok(Array.isArray(drinks) && drinks.length >= 1, 'almeno 1 drink'); ok('M2/M3: GET drink (cassa) → ' + drinks.length);
+
+  r = await fetch(BASE + '/api/regia/drink?event=' + ev, { headers: H(gc) });
+  assert.ok([401, 403].includes(r.status), 'ospite no drink'); ok('M2/M3: RBAC ospite no drink (' + r.status + ')');
+
+  r = await fetch(BASE + '/api/regia/stats?event=' + ev, { headers: H(rc) });
+  assert.equal(r.status, 200, 'stats 200'); const stt = await r.json();
+  assert.equal(typeof stt.presenze, 'number', 'presenze number');
+  assert.equal(typeof stt.gettoni_venduti, 'number', 'gettoni number (fix int, no string)');
+  assert.equal(typeof stt.ticket_totali, 'number', 'ticket number (fix int, no string)');
+  ok('M2/M3: GET stats (regia) numeri reali fase=' + stt.fase);
+
+  r = await fetch(BASE + '/api/regia/stats?event=' + ev, { headers: H(sc) });
+  assert.ok([401, 403].includes(r.status), 'cassa no stats'); ok('M2/M3: RBAC cassa no stats (' + r.status + ')');
+
+  r = await fetch(BASE + '/api/stream/regia?event=' + ev, { headers: H(sc) });
+  if (r.body) await r.body.cancel();
+  assert.ok([401, 403].includes(r.status), 'cassa no stream'); ok('M2/M3: RBAC cassa no stream (' + r.status + ')');
+  {
+    const ac = new AbortController();
+    const sr = await fetch(BASE + '/api/stream/regia?event=' + ev, { headers: { ...H(rc), accept: 'text/event-stream' }, signal: ac.signal });
+    assert.equal(sr.status, 200, 'stream regia 200'); ac.abort(); ok('M2/M3: stream regia apre SSE 200');
+  }
+
+  // consumo reale sul guest usa-e-getta (riusa `guest`); drink[0]; delta-based.
+  const d0 = drinks[0]; const sk = d0.tipo === 'premium' ? 'saldo_premium' : 'saldo_normale';
+  await fetch(BASE + '/api/cassa/topup', { method: 'POST', headers: ct(sc), body: JSON.stringify({ p_guest: guest.id, p_tipo: d0.tipo, p_qta: 1, p_importo: 0 }) });
+  const b = await fetch(BASE + '/api/guest/' + guest.id, { headers: H(gc) }).then((x) => x.json());
+  r = await fetch(BASE + '/api/cassa/consume', { method: 'POST', headers: ct(sc), body: JSON.stringify({ p_guest: guest.id, p_drink: d0.id }) });
+  assert.equal(r.status, 200, 'consume 200 (' + r.status + ')');
+  const a = await fetch(BASE + '/api/guest/' + guest.id, { headers: H(gc) }).then((x) => x.json());
+  assert.equal(a[sk], b[sk] - 1, sk + ' -1 dopo consumo');
+  assert.ok((a.ticket_totali ?? 0) > (b.ticket_totali ?? 0), 'ticket aumentati');
+  ok('M2/M3: consumo reale ' + d0.nome + ' (' + d0.tipo + ') → ' + sk + ' ' + b[sk] + '→' + a[sk] + ', ticket ' + (b.ticket_totali ?? 0) + '→' + (a.ticket_totali ?? 0));
+} else {
+  console.log('  · M2/M3 skip (REGIA_PW non impostata)');
+}
+
+console.log('\nRISULTATO: ' + pass + ' PASS — ' + BASE + ' (Postgres + Next + auth propria)');
