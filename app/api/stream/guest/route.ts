@@ -18,6 +18,15 @@
 // (refetch autoritativo RLS-scoped). Stesso principio di useGuestState che rilegge
 // la riga perché ticket_totali è GENERATED.
 //
+// CANALE FASE (additivo): oltre a `event: state` (cambi sulla riga del guest), lo
+// stream inoltra anche `event: phase` con { fase } quando cambia la fase DELL'EVENTO
+// dell'ospite. Risolviamo l'event_id dell'ospite nella stessa SELECT di authz (la
+// RLS guests_select lascia passare solo righe che il chiamante può vedere) e
+// sottoscriviamo il canale globale subscribePhase, filtrando per quell'event_id.
+// La fase è uno stato pubblico/di regia (non un dato personale), quindi — come nel
+// canale regia — può viaggiare nel payload SSE; il guest la usa per reagire subito
+// a APERTA/LAST_CALL/ESTRAZIONE senza pollare.
+//
 // LISTEN/pgbouncer: il listener (lib/sse/listener) usa una connessione PG DIRETTA
 // dedicata (DATABASE_URL_DIRECT, fallback DATABASE_URL) perché LISTEN NON funziona
 // con pgbouncer in transaction-mode. Qui invece la SELECT di authz resta su withAuth
@@ -26,7 +35,7 @@ import 'server-only';
 import { NextResponse } from 'next/server';
 import { requireAuth } from '@/lib/auth-server/guard';
 import { withAuth, type AuthClaims } from '@/lib/db';
-import { subscribeGuest } from '@/lib/sse/listener';
+import { subscribeGuest, subscribePhase } from '@/lib/sse/listener';
 import { handleError } from '../../_lib';
 
 export const runtime = 'nodejs';
@@ -48,20 +57,28 @@ export async function GET(req: Request): Promise<Response> {
 
     // Gate di autorizzazione: leggiamo la riga sotto la RLS del chiamante. 0 righe
     // → 404 (non 403): non riveliamo se l'id esiste, identico al GET /api/guest/[id].
+    // Leggiamo anche event_id (additivo) per filtrare il canale fase: la RLS
+    // guests_select garantisce che vediamo l'event_id solo di una riga lecita.
     const row = await withAuth(claims as AuthClaims, (c) =>
       c
-        .query('select id from public.guests where id = $1', [guestId])
+        .query<{ id: string; event_id: string }>(
+          'select id, event_id from public.guests where id = $1',
+          [guestId],
+        )
         .then((r) => r.rows[0] ?? null),
     );
     if (!row) {
       return NextResponse.json({ error: 'non trovato' }, { status: 404 });
     }
+    const eventId = row.event_id;
 
     // ── Stream SSE ───────────────────────────────────────────────────────────
     const encoder = new TextEncoder();
     // Ref allo stato del listener: settati alla start del ReadableStream e usati
-    // nel cancel per il teardown (idempotente, anche su abort precoce).
+    // nel cancel per il teardown (idempotente, anche su abort precoce). Due
+    // subscription: guest (event: state) + fase evento (event: phase).
     let unsubscribe: (() => void) | null = null;
+    let unsubscribePhase: (() => void) | null = null;
     let keepAlive: ReturnType<typeof setInterval> | null = null;
     let closed = false;
 
@@ -86,6 +103,15 @@ export async function GET(req: Request): Promise<Response> {
         // client rilegge la riga via GET /api/guest/[id].
         unsubscribe = subscribeGuest(guestId, () => {
           send('event: state\ndata: {}\n\n');
+        });
+
+        // Sottoscrizione al canale GLOBALE di fase: filtriamo per l'event_id
+        // dell'ospite e inoltriamo solo { fase } (stato pubblico/di regia, non un
+        // dato personale). Così il guest reagisce subito ai cambi di fase del SUO
+        // evento senza pollare.
+        unsubscribePhase = subscribePhase((payload) => {
+          if (payload.event_id !== eventId) return;
+          send(`event: phase\ndata: ${JSON.stringify({ fase: payload.fase })}\n\n`);
         });
 
         // Keep-alive periodico.
@@ -114,10 +140,14 @@ export async function GET(req: Request): Promise<Response> {
             unsubscribe();
             unsubscribe = null;
           }
+          if (unsubscribePhase) {
+            unsubscribePhase();
+            unsubscribePhase = null;
+          }
         }
       },
       cancel() {
-        // Il consumer ha annullato lo stream: stop keep-alive + unsubscribe.
+        // Il consumer ha annullato lo stream: stop keep-alive + unsubscribe (ENTRAMBE).
         closed = true;
         if (keepAlive) {
           clearInterval(keepAlive);
@@ -126,6 +156,10 @@ export async function GET(req: Request): Promise<Response> {
         if (unsubscribe) {
           unsubscribe();
           unsubscribe = null;
+        }
+        if (unsubscribePhase) {
+          unsubscribePhase();
+          unsubscribePhase = null;
         }
       },
     });

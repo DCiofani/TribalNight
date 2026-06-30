@@ -1,8 +1,14 @@
-// GET /api/event/current — id dell'evento attivo corrente.
+// GET /api/event/current — stato dell'evento attivo corrente: { event_id, fase }.
 //
-// Mappa: select current_event(). Sostituisce lib/events.ts::getCurrentEventId.
+// Mappa: select current_event() per l'id, poi events.fase di quell'evento. Sostituisce
+// lib/events.ts::getCurrentEventId (che legge .event_id) e alimenta getCurrentEventState
+// (che legge anche .fase). La risposta è ADDITIVA: i consumer attuali leggono solo
+// .event_id e NON si rompono.
+//
 // current_event() è INVOKER e dipende dalla policy events_select (to authenticated)
-// → richiede una sessione `authenticated`, fornita da withAuth(claims).
+// → richiede una sessione `authenticated`, fornita da withAuth(claims). La stessa policy
+// events_select consente la SELECT della fase. Risolviamo id+fase in UN'unica query (join
+// con current_event()), così sono coerenti e c'è un solo round-trip.
 // Gate: requireAuth (ospite o staff: qualunque autenticato).
 import 'server-only';
 import { NextResponse } from 'next/server';
@@ -16,12 +22,20 @@ export const dynamic = 'force-dynamic';
 export async function GET(req: Request): Promise<NextResponse> {
   try {
     const claims = await requireAuth(req);
-    const eventId = await withAuth(claims as AuthClaims, (c) =>
+    const row = await withAuth(claims as AuthClaims, (c) =>
       c
-        .query<{ current_event: string | null }>('select public.current_event() as current_event')
-        .then((r) => r.rows[0]?.current_event ?? null),
+        .query<{ event_id: string | null; fase: string | null }>(
+          `select e.id as event_id, e.fase as fase
+             from public.events e
+            where e.id = public.current_event()`,
+        )
+        .then((r) => r.rows[0] ?? null),
     );
-    return NextResponse.json({ event_id: eventId });
+    // Nessun evento non-CHIUSA: event_id=null (stesso significato di prima), fase=null.
+    return NextResponse.json({
+      event_id: row?.event_id ?? null,
+      fase: row?.fase ?? null,
+    });
   } catch (err) {
     return handleError(err);
   }

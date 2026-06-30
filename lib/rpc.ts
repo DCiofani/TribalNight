@@ -325,6 +325,66 @@ export async function listDrinks(
   return (data as DrinkRow[] | null) ?? [];
 }
 
+// listVisibleDrinks -> elenco drink VISIBILI dell'evento (menù dell'ospite), ordinati per
+// `ordine`. Sola lettura: nessun ricalcolo client-side. Filtra visibile=true e ordina lato DB.
+// È leggibile anche dall'ospite (la policy drinks_select consente visibile=true).
+//
+// Branch USE_API:
+//   - API: GET /api/regia/drink?event=<id>&scope=visible → DrinkRow[] (gate requireAuth
+//     server-side; il filtro visibile/ordinamento è nella route, RLS rinforza).
+//   - supabase (stile = listDrinks): select diretta su drinks filtrata event_id+visibile,
+//     order ordine.
+export async function listVisibleDrinks(
+  supabase: SupabaseClient,
+  args: { eventId: string },
+): Promise<DrinkRow[]> {
+  if (USE_API) {
+    return apiGet<DrinkRow[]>(
+      `/api/regia/drink?event=${encodeURIComponent(args.eventId)}&scope=visible`,
+    );
+  }
+
+  const { data, error } = await supabase
+    .from('drinks')
+    .select(
+      'id, event_id, nome, tipo, descrizione, categoria, immagine_url, ordine, visibile, attivo',
+    )
+    .eq('event_id', args.eventId)
+    .eq('visibile', true)
+    .order('ordine');
+  if (error) rethrow(error);
+  return (data as DrinkRow[] | null) ?? [];
+}
+
+// listAllDrinks -> elenco COMPLETO dei drink dell'evento (gestione menù in regia), ordinati
+// per `ordine`. Sola lettura: nessun filtro su attivo/visibile, nessun ricalcolo client-side.
+// Gate staff (regia/admin) lato DB/route.
+//
+// Branch USE_API:
+//   - API: GET /api/regia/drink?event=<id>&scope=all → DrinkRow[] (gate ruolo regia/admin
+//     server-side; nessun filtro, ordinamento nella route).
+//   - supabase (stile = listDrinks): select diretta su drinks filtrata event_id, order ordine.
+export async function listAllDrinks(
+  supabase: SupabaseClient,
+  args: { eventId: string },
+): Promise<DrinkRow[]> {
+  if (USE_API) {
+    return apiGet<DrinkRow[]>(
+      `/api/regia/drink?event=${encodeURIComponent(args.eventId)}&scope=all`,
+    );
+  }
+
+  const { data, error } = await supabase
+    .from('drinks')
+    .select(
+      'id, event_id, nome, tipo, descrizione, categoria, immagine_url, ordine, visibile, attivo',
+    )
+    .eq('event_id', args.eventId)
+    .order('ordine');
+  if (error) rethrow(error);
+  return (data as DrinkRow[] | null) ?? [];
+}
+
 // getEventStats -> statistiche aggregate dell'evento per la regia (fase, presenze,
 // gettoni venduti, ticket totali). Sola lettura: i conteggi sono calcolati dal DB (RPC
 // event_stats), il client non somma nulla. Gate: staff (regia/admin) lato DB/route.

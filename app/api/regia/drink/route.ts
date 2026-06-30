@@ -9,7 +9,7 @@
 import 'server-only';
 import { NextResponse } from 'next/server';
 import { withAuth, type AuthClaims } from '@/lib/db';
-import { requireRole } from '@/lib/auth-server/guard';
+import { requireRole, requireAuth } from '@/lib/auth-server/guard';
 import { isValidUuid } from '@/lib/auth-server/claims';
 import { handleError, readJson, sameOriginOk } from '../../_lib';
 
@@ -29,18 +29,46 @@ type UpsertBody = {
   p_attivo?: boolean | null;
 };
 
-// GET /api/regia/drink?event=<uuid> → DrinkRow[] (voci attive, ordinate).
-// Lettura staff (cassa/regia/admin); le colonne combaciano con DrinkRow in lib/rpc.ts.
-// La policy drinks_select autorizza già la SELECT (is_staff() vede anche non visibili).
+// GET /api/regia/drink?event=<uuid>&scope=active|visible|all → DrinkRow[] (ordinate).
+// Le colonne combaciano con DrinkRow in lib/rpc.ts. La policy drinks_select autorizza
+// già la SELECT (is_staff() vede anche le voci non visibili).
+//
+// scope (default 'active' — retrocompat ZERO-regressione con listDrinks già LIVE):
+//   active  → requireRole(['cassa','regia','admin']) ; where attivo   order ordine
+//   visible → requireAuth (anche ospite)             ; where visibile order ordine
+//             (RLS drinks_select rinforza: l'ospite vede comunque solo visibile=true)
+//   all     → requireRole(['regia','admin'])         ;            (no filtro) order ordine
 export async function GET(req: Request): Promise<NextResponse> {
   if (!sameOriginOk(req)) return NextResponse.json({ error: 'forbidden' }, { status: 403 });
   try {
-    const claims = await requireRole(req, ['cassa', 'regia', 'admin']);
+    const url = new URL(req.url);
+    const scopeParam = url.searchParams.get('scope') ?? 'active';
+    if (scopeParam !== 'active' && scopeParam !== 'visible' && scopeParam !== 'all') {
+      return NextResponse.json({ error: 'scope non valido' }, { status: 400 });
+    }
+    const scope = scopeParam as 'active' | 'visible' | 'all';
 
-    const eventId = new URL(req.url).searchParams.get('event');
+    // Gate per scope: 'visible' è leggibile anche dall'ospite (requireAuth);
+    // 'active' resta staff (cassa/regia/admin); 'all' è riservato a regia/admin.
+    const claims =
+      scope === 'visible'
+        ? await requireAuth(req)
+        : scope === 'all'
+          ? await requireRole(req, ['regia', 'admin'])
+          : await requireRole(req, ['cassa', 'regia', 'admin']);
+
+    const eventId = url.searchParams.get('event');
     if (!isValidUuid(eventId)) {
       return NextResponse.json({ error: 'event id non valido' }, { status: 400 });
     }
+
+    // Filtro WHERE per scope (l'ordinamento e le colonne sono identiche per tutti).
+    const where =
+      scope === 'active'
+        ? 'event_id = $1 and attivo'
+        : scope === 'visible'
+          ? 'event_id = $1 and visibile'
+          : 'event_id = $1';
 
     const rows = await withAuth(claims as AuthClaims, (c) =>
       c
@@ -48,7 +76,7 @@ export async function GET(req: Request): Promise<NextResponse> {
           `select id, event_id, nome, tipo, descrizione, categoria,
                   immagine_url, ordine, visibile, attivo
              from public.drinks
-            where event_id = $1 and attivo
+            where ${where}
             order by ordine`,
           [eventId],
         )

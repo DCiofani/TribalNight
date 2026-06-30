@@ -38,16 +38,20 @@ import 'server-only';
 
 import pg from 'pg';
 
-// ── Tipi dei payload (combaciano con 0004_notify.sql) ────────────────────────
+// ── Tipi dei payload (combaciano con 0004_notify.sql / 0006_notify_drinks.sql) ─
 export type GuestStatePayload = { guest_id: string };
 export type EventPhasePayload = { event_id: string; fase: string };
+export type DrinksChangedPayload = { event_id: string };
 
 export type GuestStateCallback = (payload: GuestStatePayload) => void;
 export type EventPhaseCallback = (payload: EventPhasePayload) => void;
+export type DrinksChangedCallback = (payload: DrinksChangedPayload) => void;
 
-// Nomi dei canali NOTIFY. DEVONO combaciare con pg_notify() in 0004_notify.sql.
+// Nomi dei canali NOTIFY. DEVONO combaciare con pg_notify() in 0004_notify.sql
+// e 0006_notify_drinks.sql.
 const CHANNEL_GUEST_STATE = 'guest_state';
 const CHANNEL_EVENT_PHASE = 'event_phase';
+const CHANNEL_DRINKS_CHANGED = 'drinks_changed';
 
 // Backoff di riconnessione: parte basso e raddoppia fino al cap.
 const RECONNECT_BASE_MS = 500;
@@ -66,6 +70,8 @@ type ListenerState = {
   guestSubs: Map<string, Set<GuestStateCallback>>;
   // subscriber globali sulla fase evento.
   phaseSubs: Set<EventPhaseCallback>;
+  // subscriber per-evento sul cambio listino drinks: eventId -> set di callback.
+  drinksSubs: Map<string, Set<DrinksChangedCallback>>;
 };
 
 const globalForListener = globalThis as unknown as {
@@ -82,6 +88,7 @@ function getState(): ListenerState {
     reconnectTimer: null,
     guestSubs: new Map(),
     phaseSubs: new Set(),
+    drinksSubs: new Map(),
   };
   globalForListener.__totemSseListener = state;
   return state;
@@ -146,6 +153,28 @@ function dispatchEventPhase(state: ListenerState, raw: string | undefined): void
   }
 }
 
+// Smista una notifica `drinks_changed` ai subscriber del relativo eventId.
+function dispatchDrinksChanged(state: ListenerState, raw: string | undefined): void {
+  if (!raw) return;
+  let payload: DrinksChangedPayload;
+  try {
+    payload = JSON.parse(raw) as DrinksChangedPayload;
+  } catch {
+    return; // payload malformato: ignora (non deve mai succedere col nostro trigger).
+  }
+  if (!payload || typeof payload.event_id !== 'string') return;
+  const subs = state.drinksSubs.get(payload.event_id);
+  if (!subs || subs.size === 0) return;
+  // Copia difensiva: un cb potrebbe unsubscribe durante l'iterazione.
+  for (const cb of [...subs]) {
+    try {
+      cb(payload);
+    } catch {
+      // un subscriber che lancia non deve abbattere il fan-out agli altri.
+    }
+  }
+}
+
 // Pianifica una riconnessione con backoff esponenziale (cap). No-op se non
 // `running` (shutdown) o se c'è già un timer/connect in volo.
 function scheduleReconnect(state: ListenerState): void {
@@ -174,6 +203,8 @@ async function connect(state: ListenerState): Promise<void> {
       dispatchGuestState(state, msg.payload);
     } else if (msg.channel === CHANNEL_EVENT_PHASE) {
       dispatchEventPhase(state, msg.payload);
+    } else if (msg.channel === CHANNEL_DRINKS_CHANGED) {
+      dispatchDrinksChanged(state, msg.payload);
     }
   });
 
@@ -191,6 +222,7 @@ async function connect(state: ListenerState): Promise<void> {
     await client.connect();
     await client.query(`listen ${CHANNEL_GUEST_STATE}`);
     await client.query(`listen ${CHANNEL_EVENT_PHASE}`);
+    await client.query(`listen ${CHANNEL_DRINKS_CHANGED}`);
     state.client = client;
     // Connessione sana: resetta il backoff per il prossimo drop.
     state.reconnectDelayMs = RECONNECT_BASE_MS;
@@ -264,6 +296,33 @@ export function subscribePhase(cb: EventPhaseCallback): () => void {
 }
 
 /**
+ * subscribeDrinks(eventId, cb): registra `cb` per le notifiche `drinks_changed`
+ * di quell'eventId. Avvia il listener al primo subscribe. Ritorna una funzione
+ * di unsubscribe idempotente (rimuove il cb e libera la entry se vuota).
+ */
+export function subscribeDrinks(eventId: string, cb: DrinksChangedCallback): () => void {
+  const state = getState();
+  ensureStarted(state);
+
+  let subs = state.drinksSubs.get(eventId);
+  if (!subs) {
+    subs = new Set();
+    state.drinksSubs.set(eventId, subs);
+  }
+  subs.add(cb);
+
+  let active = true;
+  return () => {
+    if (!active) return;
+    active = false;
+    const set = state.drinksSubs.get(eventId);
+    if (!set) return;
+    set.delete(cb);
+    if (set.size === 0) state.drinksSubs.delete(eventId);
+  };
+}
+
+/**
  * closeListener(): per test/shutdown puliti. Ferma il loop di reconnect, chiude
  * la connessione e svuota i registry. Dopo, una nuova subscribe ri-avvia tutto.
  */
@@ -279,6 +338,7 @@ export async function closeListener(): Promise<void> {
   state.client = null;
   state.guestSubs.clear();
   state.phaseSubs.clear();
+  state.drinksSubs.clear();
   if (client) {
     try {
       await client.end();
