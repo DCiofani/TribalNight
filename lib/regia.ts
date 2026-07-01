@@ -10,12 +10,17 @@
 // NON importiamo lib/db né lib/auth-server (server-only): l'API si parla via lib/api.
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { USE_API } from '@/lib/backend-mode';
-import { apiPost, apiPatch, apiDelete } from '@/lib/api';
+import { apiGet, apiPost, apiPatch, apiDelete } from '@/lib/api';
 import { RpcError, type TipoConsumazione } from '@/lib/rpc';
 
 // Fase del ciclo di vita dell'evento (autoritativa lato DB). La regia la fa avanzare
 // con setPhase(); le pagine leggono lo stato corrente via Realtime, non lo calcolano.
 export type Phase = 'SETUP' | 'APERTA' | 'LAST_CALL' | 'ESTRAZIONE' | 'CHIUSA';
+
+// Una riga della classifica tap di una sessione: chi ha tappato e quanto. `tap_count` è il
+// totale CUMULATIVO calcolato dal DB (register_taps: clamp/cap server-side) — il client non
+// somma nulla, mostra solo la classifica ordinata.
+export type LeaderboardRow = { guest_id: string; nome: string; tap_count: number };
 
 // rethrow locale: lib/rpc.ts tiene il suo rethrow module-private, quindi ne ridefiniamo
 // qui una copia identica (3 righe). Nasconde la differenza PostgREST/Supabase/route /api
@@ -301,4 +306,51 @@ export async function setDrinkActive(
   });
   if (error) rethrow(error);
   return data;
+}
+
+// getLeaderboard(...) -> classifica tap di una sessione: [{ guest_id, nome, tap_count }]
+// ordinata per tap_count desc. Sola lettura, NIENTE ricalcolo: tap_count è il totale
+// cumulativo prodotto dal DB (register_taps con clamp/cap), il client si limita a mostrarlo.
+// Alimenta la leaderboard live di R3. Gate staff (regia/admin) lato route (RLS) o RLS diretta.
+//
+// register_taps fa upsert su (session_id, guest_id) → 1 riga per (sessione, ospite): niente
+// da aggregare, si legge taps join guests e si ordina. Lo staff legge tutte le righe grazie
+// alle policy taps_select/guests_select (is_staff()).
+//
+// Branch USE_API:
+//   - API: GET /api/regia/session/leaderboard?session=<id> → LeaderboardRow[]
+//     (gate ruolo regia/admin server-side; join+order+limit nella route).
+//   - supabase (INVARIATO come stile listDrinks): select su taps con embed guests(nome),
+//     filtrata session_id, order tap_count desc; poi appiattita a LeaderboardRow.
+export async function getLeaderboard(
+  supabase: SupabaseClient,
+  args: { sessionId: string },
+): Promise<LeaderboardRow[]> {
+  if (USE_API) {
+    return apiGet<LeaderboardRow[]>(
+      `/api/regia/session/leaderboard?session=${encodeURIComponent(args.sessionId)}`,
+    );
+  }
+
+  // Embed su FK taps.guest_id → guests.id: guests(nome) arriva come oggetto annidato.
+  // !inner scarta eventuali orfani (guest cancellato) e permette l'order sul nome.
+  const { data, error } = await supabase
+    .from('taps')
+    .select('guest_id, tap_count, guests!inner(nome)')
+    .eq('session_id', args.sessionId)
+    .order('tap_count', { ascending: false })
+    .limit(50);
+  if (error) rethrow(error);
+
+  // Appiattisco l'embed {guests:{nome}} → {nome}. Supabase può tipizzare l'embed come
+  // oggetto o array a seconda dell'inferenza FK: normalizzo entrambe le forme.
+  type Nested = {
+    guest_id: string;
+    tap_count: number;
+    guests: { nome: string } | { nome: string }[] | null;
+  };
+  return ((data as Nested[] | null) ?? []).map((r) => {
+    const g = Array.isArray(r.guests) ? r.guests[0] : r.guests;
+    return { guest_id: r.guest_id, nome: g?.nome ?? '', tap_count: r.tap_count };
+  });
 }

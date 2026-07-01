@@ -37,6 +37,7 @@ import {
 import {
   getEventStats,
   listAllDrinks,
+  getActiveSession,
   RpcError,
   type EventStats,
   type DrinkRow,
@@ -45,13 +46,16 @@ import {
 import {
   setPhase,
   startSession,
+  closeSession,
   runDraw,
   updateEventSettings,
   upsertDrink,
   deleteDrink,
   setDrinkVisibility,
   setDrinkActive,
+  getLeaderboard,
   type Phase,
+  type LeaderboardRow,
 } from '@/lib/regia';
 
 // Fasi del flusso serata (spec §10). Ordine/labels per timeline e controlli; la fase
@@ -81,6 +85,11 @@ const TAB_TITLE: Record<RegiaTab, string> = {
 // Intervallo polling di FALLBACK (path supabase o EventSource non disponibile): rilegge
 // le stats ogni ~3s. In modalità API+SSE NON si fa polling: push via stream.
 const POLL_MS = 3000;
+
+// Intervallo polling della CLASSIFICA LIVE (tab sessioni, R3): ~2s. La leaderboard è
+// pura lettura (getLeaderboard), i tap_count arrivano CUMULATIVI dal DB; il client non
+// somma nulla. Anche la finestra della sessione attiva (getActiveSession) si rilegge qui.
+const LEADERBOARD_POLL_MS = 2000;
 
 // ── Palette design (mockup Regia) ─────────────────────────────────────────────
 // Coerente con components/screens/Regia.tsx (sfondo #190F08, superficie #2A1A11,
@@ -190,6 +199,57 @@ function ComingSoon({ label }: { label: string }) {
   );
 }
 
+// Colore posizione classifica (R3): oro → argento → bronzo per il podio, poi tenue.
+// Solo presentazionale, il ranking arriva già ordinato dal server (tap_count desc).
+const EMBER = '#EE6321'; // ambra del mockup (barra viola→ambra, countdown)
+function rankColor(pos: number): string {
+  if (pos === 1) return C.gold;
+  if (pos === 2) return C.goldSoft;
+  if (pos === 3) return EMBER;
+  return C.inkMuted;
+}
+
+// Anello countdown (R3): Anton al centro, arco ambra che si svuota man mano che i secondi
+// scendono. `secondi` è UX (dalla scadenza server): non è un dato autoritativo di tap/ticket.
+function CountdownRing({ secondi, durataTotale }: { secondi: number; durataTotale: number }) {
+  const R = 44;
+  const CIRC = 2 * Math.PI * R; // ~276
+  const frac = durataTotale > 0 ? Math.max(0, Math.min(1, secondi / durataTotale)) : 0;
+  const offset = CIRC * (1 - frac); // pieno a inizio, vuoto a 0s
+  return (
+    <div style={{ position: 'relative', width: 78, height: 78, flexShrink: 0 }}>
+      <svg viewBox="0 0 100 100" style={{ width: '100%', height: '100%', transform: 'rotate(-90deg)' }}>
+        <circle cx="50" cy="50" r={R} fill="none" stroke="#3A2414" strokeWidth="8" />
+        <circle
+          cx="50"
+          cy="50"
+          r={R}
+          fill="none"
+          stroke={EMBER}
+          strokeWidth="8"
+          strokeLinecap="round"
+          strokeDasharray={CIRC}
+          strokeDashoffset={offset}
+          style={{ filter: `drop-shadow(0 0 6px ${EMBER})`, transition: 'stroke-dashoffset 1s linear' }}
+        />
+      </svg>
+      <div
+        style={{
+          position: 'absolute',
+          inset: 0,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          fontFamily: 'var(--font-display)',
+          fontSize: 24,
+        }}
+      >
+        {secondi}
+      </div>
+    </div>
+  );
+}
+
 export default function RegiaPage() {
   // Istanza supabase singola e stabile per tutta la vita della pagina.
   const supabase = useMemo(() => createClient(), []);
@@ -222,6 +282,20 @@ export default function RegiaPage() {
 
   // ── Estrazione (esito ultimo run) ───────────────────────────────────────
   const [drawResult, setDrawResult] = useState<string | null>(null);
+
+  // ── Sessioni tap (R3) — stato LIVE/IDLE, tutto SOLA LETTURA dal server ───
+  // activeSession: finestra della sessione attiva (getActiveSession) o null (IDLE).
+  // leaderboard: classifica tap live (getLeaderboard), tap_count CUMULATIVO dal DB.
+  // secondsLeft: countdown UX ricavato dalla scadenza (non autoritativo).
+  const [activeSession, setActiveSession] = useState<{
+    session_id: string;
+    scadenza: string;
+    secondi_rimasti: number;
+  } | null>(null);
+  const [sessionChecked, setSessionChecked] = useState(false);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const [leaderboard, setLeaderboard] = useState<LeaderboardRow[]>([]);
+  const [secondsLeft, setSecondsLeft] = useState<number | null>(null);
 
   // ── Impostazioni evento (form minimale, campi opzionali) ────────────────
   const [setNormale, setSetNormale] = useState('');
@@ -277,6 +351,45 @@ export default function RegiaPage() {
       setDrinksError(null);
     } catch (err) {
       setDrinksError(err instanceof Error ? err.message : 'Listino non disponibile');
+    }
+  }
+
+  // Ref alla sessione attiva corrente, per leggere la leaderboard nel polling senza
+  // rilegare l'effetto ad ogni cambio scadenza (l'id è la sola cosa che conta).
+  const activeSessionIdRef = useRef<string | null>(null);
+  activeSessionIdRef.current = activeSession?.session_id ?? null;
+
+  // Fetch SOLA LETTURA della sessione attiva (R3): finestra temporale dell'arena o null.
+  // secondi_rimasti è UX (dal server nel path API, derivato nel path supabase) — non
+  // ricalcoliamo tap/ticket. Se scompare (chiusa/scaduta) svuotiamo anche la classifica.
+  async function refetchActiveSession() {
+    const id = eventIdRef.current;
+    if (!id) return;
+    try {
+      const s = await getActiveSession(supabase, { eventId: id });
+      setActiveSession(s);
+      setSecondsLeft(s ? s.secondi_rimasti : null);
+      if (!s) setLeaderboard([]);
+      setSessionError(null);
+    } catch (err) {
+      setSessionError(err instanceof Error ? err.message : 'Sessione non disponibile');
+    } finally {
+      setSessionChecked(true);
+    }
+  }
+
+  // Fetch SOLA LETTURA della classifica tap live della sessione attiva. tap_count è il
+  // totale CUMULATIVO dal DB (register_taps clamp/cap): qui NON si somma nulla, si ordina
+  // e si mostra. Riordino live perché la lista arriva già ordinata tap_count desc.
+  async function refetchLeaderboard() {
+    const sid = activeSessionIdRef.current;
+    if (!sid) return;
+    try {
+      const rows = await getLeaderboard(supabase, { sessionId: sid });
+      setLeaderboard(rows);
+      setSessionError(null);
+    } catch (err) {
+      setSessionError(err instanceof Error ? err.message : 'Classifica non disponibile');
     }
   }
 
@@ -415,6 +528,44 @@ export default function RegiaPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [staff, eventId]);
 
+  // ── Sessioni tap (R3): polling ~2s di sessione attiva + classifica live. ──
+  // Attivo SOLO quando il tab 'sessioni' è aperto (niente polling di fondo altrove).
+  // Tutto SOLA LETTURA: getActiveSession (finestra) + getLeaderboard (tap CUMULATIVI dal DB).
+  useEffect(() => {
+    if (!staff || !eventId || tab !== 'sessioni') return;
+    let active = true;
+
+    // Primo giro: prima la sessione (per avere l'id), poi la classifica se c'è.
+    void (async () => {
+      await refetchActiveSession();
+      if (active) await refetchLeaderboard();
+    })();
+
+    const timer = setInterval(() => {
+      if (!active) return;
+      void (async () => {
+        await refetchActiveSession();
+        if (active) await refetchLeaderboard();
+      })();
+    }, LEADERBOARD_POLL_MS);
+
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [staff, eventId, tab]);
+
+  // Countdown UX locale: scala secondsLeft ogni secondo tra un poll e l'altro (il valore
+  // autoritativo resta la scadenza dal server, ri-sincronizzata ad ogni refetchActiveSession).
+  useEffect(() => {
+    if (secondsLeft === null || secondsLeft <= 0) return;
+    const t = setInterval(() => {
+      setSecondsLeft((s) => (s === null ? null : Math.max(0, s - 1)));
+    }, 1000);
+    return () => clearInterval(t);
+  }, [secondsLeft]);
+
   // ── Handlers ────────────────────────────────────────────────────────────
 
   async function handleLogin(e: React.FormEvent) {
@@ -449,6 +600,11 @@ export default function RegiaPage() {
     setActionError(null);
     setFeedback(null);
     setDrawResult(null);
+    setActiveSession(null);
+    setSessionChecked(false);
+    setSessionError(null);
+    setLeaderboard([]);
+    setSecondsLeft(null);
     setDrinks([]);
     setDrinksError(null);
     setMenuError(null);
@@ -491,8 +647,34 @@ export default function RegiaPage() {
   function handleStartSession() {
     void runAction(
       'session',
-      () => startSession(supabase, { eventId: eventId as string, durata: 30 }),
+      async () => {
+        const res = await startSession(supabase, { eventId: eventId as string, durata: 30 });
+        // Transizione IDLE→LIVE immediata: rilegge la sessione attiva (e azzera la
+        // classifica precedente) senza attendere il prossimo giro di polling.
+        await refetchActiveSession();
+        return res;
+      },
       'Sessione 30s lanciata',
+    );
+  }
+
+  // Chiude la sessione attiva (regia): close_session assegna i ticket_tap lato DB e
+  // ritorna il totale ticket. Qui NON ricalcoliamo nulla: dopo la chiusura rilegge la
+  // sessione (→ null, stato IDLE) e le stats (ticket_totali aggiornati dal server).
+  function handleCloseSession() {
+    const sid = activeSession?.session_id;
+    if (!sid) return;
+    void runAction(
+      'session-close',
+      async () => {
+        const ticket = await closeSession(supabase, { sessionId: sid });
+        setActiveSession(null);
+        setSecondsLeft(null);
+        setLeaderboard([]);
+        await refetchActiveSession();
+        return ticket;
+      },
+      'Sessione chiusa · ticket assegnati',
     );
   }
 
@@ -868,35 +1050,146 @@ export default function RegiaPage() {
           </>
         )}
 
-        {/* ── R3 — Sessioni tap ─────────────────────────────────────────── */}
+        {/* ── R3 — Sessioni tap: LIVE (classifica) o IDLE (lancia) ──────── */}
         {tab === 'sessioni' && (
           <>
-            <div style={panel}>
-              <div style={{ fontFamily: 'var(--font-ritual)', letterSpacing: '.16em', fontSize: 11, color: C.inkMuted, marginBottom: 10 }}>
-                LANCIA SESSIONE
-              </div>
-              <p style={{ margin: '0 0 16px', color: C.inkSoft, fontSize: 14 }}>
-                Avvia una sessione tap da 30 secondi. Fase attuale:{' '}
-                <b style={{ color: '#fff' }}>{currentPhase ? PHASE_LABEL[currentPhase] : '—'}</b>.
-              </p>
-              <DButton
-                variant="gold"
-                disabled={!eventId || busyAction !== null}
-                onClick={handleStartSession}
-              >
-                {busyAction === 'session' ? 'Lancio…' : 'Lancia sessione 30s'}
-              </DButton>
-              {actionError && <Note kind="err">{actionError}</Note>}
-              {feedback && <Note kind="ok">{feedback}</Note>}
-            </div>
+            {/* Prima lettura in corso: nessuno stato ancora deciso. */}
+            {eventId && !sessionChecked && (
+              <div style={{ ...panel, color: C.inkMuted, fontSize: 14 }}>Verifica sessione…</div>
+            )}
 
-            <div style={{ ...panel, color: C.inkMuted, fontSize: 14 }}>
-              <div style={{ fontFamily: 'var(--font-ritual)', letterSpacing: '.16em', fontSize: 11, color: C.gold, marginBottom: 8 }}>
-                CLASSIFICA LIVE — IN ARRIVO
+            {/* ── R3b IDLE — nessuna sessione attiva: card di lancio. ────── */}
+            {eventId && sessionChecked && !activeSession && (
+              <div style={{ ...panel, borderColor: C.border, textAlign: 'center', maxWidth: 560, margin: '0 auto', width: '100%' }}>
+                <div style={{ fontSize: 46, lineHeight: 1 }} aria-hidden>⚡</div>
+                <div style={{ fontFamily: 'var(--font-display)', fontSize: 30, marginTop: 8, letterSpacing: '.02em' }}>
+                  NESSUNA SESSIONE ATTIVA
+                </div>
+                <div style={{ margin: '22px 0 6px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 14 }}>
+                  <span style={{ color: C.inkSoft, fontSize: 15 }}>Durata</span>
+                  <span
+                    style={{
+                      width: 90,
+                      height: 46,
+                      borderRadius: 10,
+                      background: '#190F08',
+                      border: `1px solid ${C.border}`,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      fontFamily: 'var(--font-display)',
+                      fontSize: 20,
+                    }}
+                  >
+                    30s
+                  </span>
+                </div>
+                <div style={{ marginTop: 22, display: 'flex', justifyContent: 'center' }}>
+                  <DButton variant="gold" disabled={!eventId || busyAction !== null} onClick={handleStartSession}>
+                    {busyAction === 'session' ? 'Lancio…' : 'Lancia sessione 30s'}
+                  </DButton>
+                </div>
+                {actionError && <Note kind="err">{actionError}</Note>}
+                {feedback && <Note kind="ok">{feedback}</Note>}
+                {sessionError && <Note kind="err">{sessionError}</Note>}
               </div>
-              La leaderboard tap in tempo reale non è ancora disponibile (endpoint dedicato non
-              cablato). Placeholder coerente col design: nessun dato inventato.
-            </div>
+            )}
+
+            {/* ── R3 LIVE — sessione attiva: countdown + classifica live. ── */}
+            {eventId && activeSession && (
+              <>
+                {/* Header: anello countdown + titolo + Chiudi sessione. */}
+                <div style={{ ...panel, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 20, flexWrap: 'wrap' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
+                    <CountdownRing secondi={secondsLeft ?? 0} durataTotale={30} />
+                    <div style={{ fontFamily: 'var(--font-display)', fontSize: 30, letterSpacing: '.02em' }}>
+                      CLASSIFICA LIVE
+                    </div>
+                  </div>
+                  <DButton variant="danger" disabled={busyAction !== null} onClick={handleCloseSession}>
+                    {busyAction === 'session-close' ? 'Chiusura…' : 'Chiudi sessione'}
+                  </DButton>
+                </div>
+
+                {actionError && <Note kind="err">{actionError}</Note>}
+                {feedback && <Note kind="ok">{feedback}</Note>}
+
+                {/* Classifica (righe con barra) + pannello partecipanti/tap totali. */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 280px', gap: 24, alignItems: 'start' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {sessionError && <Note kind="err">{sessionError}</Note>}
+                    {leaderboard.length === 0 && !sessionError && (
+                      <div style={{ ...panel, color: C.inkMuted, fontSize: 14 }}>
+                        Ancora nessun tap. La classifica si popola in tempo reale.
+                      </div>
+                    )}
+                    {(() => {
+                      // Barra proporzionale al leader (solo presentazionale: i tap_count
+                      // sono CUMULATIVI dal DB, qui non si somma né si ricalcola nulla).
+                      const maxTaps = leaderboard.reduce((m, r) => Math.max(m, r.tap_count), 0);
+                      return leaderboard.map((r, i) => {
+                        const pos = i + 1;
+                        const pct = maxTaps > 0 ? Math.round((r.tap_count / maxTaps) * 100) : 0;
+                        return (
+                          <div
+                            key={r.guest_id}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 14,
+                              background: C.surface,
+                              border: `1px solid ${C.border}`,
+                              borderRadius: 12,
+                              padding: '12px 16px',
+                              transition: 'background .3s ease',
+                            }}
+                          >
+                            <div style={{ fontFamily: 'var(--font-display)', fontSize: 20, width: 30, color: rankColor(pos) }}>
+                              {pos}
+                            </div>
+                            <div style={{ width: 150, fontWeight: 600, fontSize: 15, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                              {r.nome || '—'}
+                            </div>
+                            <div style={{ flex: 1, minWidth: 0, height: 14, borderRadius: 99, background: '#1B0F07', overflow: 'hidden' }}>
+                              <div
+                                style={{
+                                  height: '100%',
+                                  width: `${pct}%`,
+                                  borderRadius: 99,
+                                  background: `linear-gradient(90deg, ${C.blue}, ${EMBER})`,
+                                  transition: 'width .5s ease',
+                                }}
+                              />
+                            </div>
+                            <div style={{ fontFamily: 'var(--font-display)', fontSize: 18, color: C.gold, width: 60, textAlign: 'right' }}>
+                              {r.tap_count}
+                            </div>
+                          </div>
+                        );
+                      });
+                    })()}
+                  </div>
+
+                  {/* Mini-pannello derivato dalla classifica (presentazionale). */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                    <div style={{ ...panel, padding: 20 }}>
+                      <div style={{ fontFamily: 'var(--font-ritual)', letterSpacing: '.14em', fontSize: 11, color: C.inkMuted }}>
+                        PARTECIPANTI ATTIVI
+                      </div>
+                      <div style={{ fontFamily: 'var(--font-display)', fontSize: 38 }}>{leaderboard.length}</div>
+                    </div>
+                    <div style={{ ...panel, padding: 20 }}>
+                      <div style={{ fontFamily: 'var(--font-ritual)', letterSpacing: '.14em', fontSize: 11, color: C.inkMuted }}>
+                        TAP TOTALI
+                      </div>
+                      <div style={{ fontFamily: 'var(--font-display)', fontSize: 38, color: EMBER }}>
+                        {leaderboard.reduce((sum, r) => sum + r.tap_count, 0)}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
           </>
         )}
 

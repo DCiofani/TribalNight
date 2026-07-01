@@ -6,6 +6,22 @@ Tutte le modifiche rilevanti a **Totem Night**. Formato: [Keep a Changelog](http
 
 ## [Unreleased]
 
+### M3 — sessioni tap: arena ospite G7/G8 + leaderboard regia R3 ✅
+- **Workflow multi-agente** (enabler ∥ → UI ∥ → review, file-disgiunti). Nessuna migration: RLS `sessions_select`/`taps_select` già sufficienti.
+- **Enabler read**: `GET /api/session/active?event=` (guest-safe, requireAuth; sessione `stato='active' AND now()<=ends_at`, ritorna `{session_id, scadenza, secondi_rimasti}`) + `getActiveSession` (lib/rpc.ts). `GET /api/regia/session/leaderboard?session=` (staff; `taps` JOIN `guests`, 1 riga per (session,guest) → nessuna aggregazione) + `getLeaderboard`/`LeaderboardRow` (lib/regia.ts).
+- **Guest G7 arena** (`components/screens/TapArena.tsx`): full-screen, countdown Anton + anello ambra ancorato allo **scadenza SERVER** (non timer cieco), Totem liv.6 come superficie tap (onPointerDown) con burst, contatore locale ottimistico. **G8 esito** (`EsitoTap.tsx`): ticket guadagnati (delta da `useGuestState` dopo `close_session`, mai calcolati dal client). `app/guest/page.tsx`: polling `getActiveSession` ~2s solo in APERTA → auto-entra arena → batch `registerTaps` CUMULATIVO ~1s + flush → esito. Hub G3-G6 invariati.
+- **Regia R3** (`app/regia/page.tsx` tab sessioni): IDLE (Lancia sessione 30s) / LIVE (countdown + **classifica live** polling `getLeaderboard` ~2s, barre viola→ambra, chiudi sessione). Review verdict **ok** (1 low: 1° tick leaderboard ~2s ritardo, auto-correggente).
+- ✅ `tsc` pulito; `next build` (api) verde (`/api/session/active`, `/api/regia/session/leaderboard`, /guest 9.1kB, /regia 9.5kB).
+
+### Test di CARICO / CONCORRENZA (bot paralleli reali) ✅ — 2 hardening trovati
+- **Workflow multi-agente stress** (4 cohort bot ∥ + invarianti DB) su Supabase locale, script in scratchpad (non nel repo). Verifica le garanzie server-authoritative **sotto concorrenza reale**:
+  - **Registration storm** (15-20 register concorrenti): PIN **unici**, 0 duplicati, `UNIQUE(event_id,pin)` regge; sotto saturazione 4-cifre → fallback 6-cifre. ✅
+  - **Topup idempotenza** (12 topup ∥ stesso `p_idem`): saldo **+5 una sola volta** (non +60), 1 riga ledger; idem diversi → +12 esatti. ✅
+  - **Consumo oversell** (15 consume ∥, saldo 3): **esattamente 3 ok, 12 rifiutati** "saldo insufficiente", saldo→0 **mai negativo**, 3 tx (lock `FOR UPDATE` serializza). ✅
+  - **Tap storm** (10 ospiti ∥, count cumulativo 10/25/40): clamp/cap temporale reggono (max 28 vs 40 inviati), `close_session` → 20 ticket coerenti + idempotente. 164/164 assert. ✅
+  - **Invarianti globali DB**: 0 saldi negativi, 0 PIN duplicati, ticket ≥0, ledger coerente. ✅
+- ⚠️ **2 difetti di robustezza trovati** (la CORRETTEZZA regge sempre — invarianti mai violate — ma sotto concorrenza danno 500 sporchi): (1) **`topup` TOCTOU** — retry concorrenti stesso `p_idem` collidono su `transactions_pkey` → HTTP 500 grezzo invece del ramo idempotente (200 tx esistente); (2) **`register_guest`** — pre-check PIN non atomico + INSERT senza handler `unique_violation`. Fix in arrivo (migration hardening: `exception when unique_violation`).
+
 ### Design Claude — cassa (C1-C5) + regia (R1-R8 shell) ✅
 - **Cassa** (`app/cassa/page.tsx` + `components/screens/CassaScreens.tsx`): **drop-in** dal handoff — la page era già cablata al mio stack M2 esatto (`staffSignIn`/gate ruolo, `lookupGuestByPin`, `topup`/`consume` con `consumeIdemRef`, `listDrinks`, `getCurrentEventState` per gating fase). Flow C1 Home (Ricarica/Consuma + pill fase) → C2 scan (PIN) → C3 ricarica → C4 consuma (listino) → C5 conferma. Fix orfano `setFeedback` rimosso.
 - **Regia** (`app/regia/page.tsx` riscritta + `components/screens/Regia.tsx`): design **sidebar + shell dark Linear-style** (`RegiaSidebar`/`RegiaShell`/`RegiaDashboard`), tab cablati alla logica M2 preservata: R1 dashboard (KPI reali da `getEventStats`), R2 fasi (`setPhase`), R3 sessioni (`startSession`), R4 gestione menù (CRUD `listAllDrinks`+`upsert`/`delete`/`setDrinkVisibility`/`setDrinkActive`), R5 impostazioni (`updateEventSettings`, 3/9 campi), R6 estrazione (`runDraw`). R7 ledger / R8 ospiti = placeholder shell. Gate ruolo regia/admin, stream `/api/stream/{regia,drinks}` + polling, `USE_API`. Nessun ricalcolo client. Fix ESLint `no-unescaped-entities`.

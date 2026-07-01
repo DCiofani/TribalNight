@@ -227,6 +227,48 @@ export async function registerTaps(
   return data;
 }
 
+// getActiveSession(...) -> sessione di tap ATTIVA dell'evento, o null se non ce n'è.
+// "Attiva" = tap_sessions.stato='active' AND now() <= ends_at (`ends_at` è la scadenza,
+// stessa condizione con cui register_taps accetta i tap). Gate: requireAuth (ospite incluso).
+// Sola LETTURA della finestra temporale dell'arena (UX): NON è un dato autoritativo di
+// ticket/tap (quelli restano nel DB via register_taps/close_session).
+//
+// Branch USE_API:
+//   - API: GET /api/session/active?event=<id> → { session_id, scadenza, secondi_rimasti }
+//     o null. secondi_rimasti è calcolato lato DB (niente fiducia nell'orologio del client).
+//   - supabase: SELECT diretta su tap_sessions (RLS sessions_select la consente all'ospite);
+//     secondi_rimasti è derivato qui SOLO come UX (ceil dei secondi residui, clamp≥0) — non
+//     è un conteggio autoritativo. maybeSingle()→null se nessuna sessione attiva.
+export async function getActiveSession(
+  supabase: SupabaseClient,
+  args: { eventId: string },
+): Promise<{ session_id: string; scadenza: string; secondi_rimasti: number } | null> {
+  if (USE_API) {
+    return apiGet<{ session_id: string; scadenza: string; secondi_rimasti: number } | null>(
+      `/api/session/active?event=${encodeURIComponent(args.eventId)}`,
+    );
+  }
+
+  const nowMs = Date.now();
+  const { data, error } = await supabase
+    .from('tap_sessions')
+    .select('id, ends_at')
+    .eq('event_id', args.eventId)
+    .eq('stato', 'active')
+    .gte('ends_at', new Date(nowMs).toISOString())
+    .order('started_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) rethrow(error);
+  const row = data as { id: string; ends_at: string } | null;
+  if (!row) return null;
+  const secondi_rimasti = Math.max(
+    0,
+    Math.ceil((new Date(row.ends_at).getTime() - nowMs) / 1000),
+  );
+  return { session_id: row.id, scadenza: row.ends_at, secondi_rimasti };
+}
+
 // convertCredit(...) -> conversione finale credito -> ticket (fase LAST_CALL).
 // Idempotente su p_idem: ritentare con LO STESSO idem NON converte due volte
 // (la RPC ritorna la conversione già scritta). Gate self-or-staff: l'ospite può convertire

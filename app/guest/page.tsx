@@ -14,13 +14,15 @@ import { useRouter } from 'next/navigation';
 import { loadGuestId } from '@/lib/guest-session';
 import { useGuestState } from '@/lib/useGuestState';
 import { createClient } from '@/lib/supabase/client';
-import { listVisibleDrinks, type DrinkRow } from '@/lib/rpc';
+import { listVisibleDrinks, getActiveSession, registerTaps, type DrinkRow } from '@/lib/rpc';
 import { getCurrentEventState } from '@/lib/events';
 import { USE_API } from '@/lib/backend-mode';
 import GuestHome from '@/components/screens/GuestHome';
 import GuestMenu, { type MenuItem } from '@/components/screens/GuestMenu';
 import GuestMovimenti, { type Tx } from '@/components/screens/GuestMovimenti';
 import GuestQR from '@/components/screens/GuestQR';
+import TapArena from '@/components/screens/TapArena';
+import EsitoTap from '@/components/screens/EsitoTap';
 
 // Seed deterministico dall'id ospite → totem stabile per-ospite (SSR-safe).
 function seedFromId(id: string): number {
@@ -43,6 +45,21 @@ const MENU_POLL_MS = 20000;
 // supabase, o se l'EventSource non è disponibile, si rilegge via getCurrentEventState
 // con questo intervallo. La fase resta SEMPRE autoritativa dal DB.
 const PHASE_POLL_MS = 15000;
+
+// ── Tap arena (G7/G8) ────────────────────────────────────────────────────────
+// Polling della sessione di tap ATTIVA: SOLO in fase APERTA (il regista lancia le
+// sessioni durante il bar aperto). getActiveSession è una finestra UX: la scadenza è
+// autoritativa dal server, secondi_rimasti è ricalcolato client-side dalla scadenza.
+const SESSION_POLL_MS = 2000;
+
+// Cadenza di invio del conteggio CUMULATIVO dei tap durante l'arena. registerTaps NON
+// somma: inviamo il totale locale corrente; il DB clampa/cappa server-side (anti-cheat).
+const TAP_FLUSH_MS = 1000;
+
+// Attesa massima, a scadenza sessione, che il regista chiuda la sessione (close_session)
+// e i ticket vengano assegnati (delta su ticket_totali via useGuestState). Oltre questo
+// mostriamo comunque l'esito con i ticket noti (0 = "nessun ticket stavolta").
+const CLOSE_WAIT_MS = 20000;
 
 // Tag presentazionali (colori del mockup DEMO). NB: il tag indica il TIPO di
 // consumazione richiesto, NON un prezzo (il front-end non calcola nulla). Oggi tutte
@@ -98,7 +115,7 @@ const DEMO_TX: Tx[] = [
   { icon: '🥃', iconBg: '#3A2414', label: 'Mezcal Ember', time: '21:40', delta: '−1 premium', deltaColor: '#9BB6EC' },
 ];
 
-type View = 'totem' | 'menu' | 'movimenti';
+type View = 'totem' | 'menu' | 'movimenti' | 'tap' | 'esito';
 
 export default function GuestPage() {
   const router = useRouter();
@@ -244,6 +261,185 @@ export default function GuestPage() {
     };
   }, [guestId, refetchPhase]);
 
+  // ── Tap arena (G7) + Esito (G8) ────────────────────────────────────────────
+  // Sessione di tap ATTIVA (finestra UX): id + scadenza server. secondiRimasti è
+  // SEMPRE ricalcolato dalla scadenza (non un timer cieco). tapLocali è un contatore
+  // locale OTTIMISTICO: i ticket VERI arrivano dal DB (delta ticket_totali) dopo
+  // close_session del regista — qui NON si calcola nulla di autoritativo.
+  const [session, setSession] = useState<{ sessionId: string; scadenza: string } | null>(null);
+  const [secondiRimasti, setSecondiRimasti] = useState(0);
+  const [tapLocali, setTapLocali] = useState(0);
+  // Ref al contatore tap LIVE: gli effetti (arena tick + flush) leggono l'ultimo valore
+  // senza dipendere da `tapLocali` (che cambia ad ogni tap → eviterebbe di ricreare i timer).
+  const tapLocaliRef = useRef(0);
+  tapLocaliRef.current = tapLocali;
+
+  // Esito: delta ticket (dopo close_session) + tap totali della sessione.
+  const [esitoPending, setEsitoPending] = useState(false);
+  const [esitoTicket, setEsitoTicket] = useState(0);
+  const [esitoTap, setEsitoTap] = useState(0);
+
+  // Snapshot ticket PRIMA di entrare in arena (per il delta) + ref al ticket LIVE, così
+  // gli effetti leggono l'ultimo valore senza ri-sottoscriversi ad ogni cambio.
+  const ticketPrimaRef = useRef<number | null>(null);
+  const ticketLiveRef = useRef<number | null>(ticketTotali);
+  ticketLiveRef.current = ticketTotali;
+
+  // Sessioni GIÀ giocate: evita di rientrare nella stessa arena se, tornati all'hub, la
+  // sessione risulta ancora attiva per qualche secondo (skew orologio client/server).
+  const playedSessionsRef = useRef<Set<string>>(new Set());
+
+  // secondi_rimasti ricalcolato dalla scadenza server (UX): clamp ≥ 0.
+  const secondsLeftFromScadenza = useCallback((scadenza: string): number => {
+    return Math.max(0, Math.ceil((new Date(scadenza).getTime() - Date.now()) / 1000));
+  }, []);
+
+  // (A) Polling della sessione di tap ATTIVA — SOLO in fase APERTA e SOLO fuori
+  //     dall'arena/esito. Se compare una sessione: snapshot ticket, reset tap, entra.
+  useEffect(() => {
+    if (!guestId || !eventId) return;
+    if (fase !== 'APERTA') return;
+    if (view === 'tap' || view === 'esito') return;
+
+    let active = true;
+    const isActive = () => active;
+    let timer: ReturnType<typeof setInterval> | null = null;
+
+    const check = async () => {
+      try {
+        const s = await getActiveSession(supabaseRef.current!, { eventId });
+        if (!isActive() || !s) return;
+        if (playedSessionsRef.current.has(s.session_id)) return; // già giocata
+        // Entra in arena: fissa lo snapshot ticket "prima", azzera i tap locali.
+        ticketPrimaRef.current = ticketLiveRef.current ?? 0;
+        setTapLocali(0);
+        setSession({ sessionId: s.session_id, scadenza: s.scadenza });
+        setSecondiRimasti(secondsLeftFromScadenza(s.scadenza));
+        setView('tap');
+      } catch {
+        // Errore transitorio: ritenta al prossimo giro.
+      }
+    };
+
+    void check();
+    timer = setInterval(() => void check(), SESSION_POLL_MS);
+    return () => {
+      active = false;
+      if (timer) clearInterval(timer);
+    };
+  }, [guestId, eventId, fase, view, secondsLeftFromScadenza]);
+
+  // (B) Arena live: mentre view==='tap', ricalcola secondiRimasti dalla scadenza e
+  //     verifica che la sessione sia ancora attiva. A scadenza (≤0) o sessione non più
+  //     attiva → passa all'esito (flush finale dei tap gestito nell'effetto (C)).
+  useEffect(() => {
+    if (view !== 'tap' || !session || !eventId) return;
+    let active = true;
+    const isActive = () => active;
+
+    const goEsito = () => {
+      if (!isActive()) return;
+      playedSessionsRef.current.add(session.sessionId);
+      setEsitoTap(tapLocaliRef.current);
+      setEsitoTicket(0);
+      setEsitoPending(true);
+      setView('esito');
+      setSession(null);
+    };
+
+    // tick del countdown (server-derived) ~4/s per fluidità dell'anello.
+    const tick = setInterval(() => {
+      if (!isActive()) return;
+      const left = secondsLeftFromScadenza(session.scadenza);
+      setSecondiRimasti(left);
+      if (left <= 0) goEsito();
+    }, 250);
+
+    // poll di conferma "sessione ancora attiva": se il regista chiude prima → esito.
+    const poll = setInterval(async () => {
+      try {
+        const s = await getActiveSession(supabaseRef.current!, { eventId });
+        if (!isActive()) return;
+        if (!s || s.session_id !== session.sessionId) goEsito();
+      } catch {
+        // errore transitorio: il countdown locale resta il riferimento.
+      }
+    }, SESSION_POLL_MS);
+
+    return () => {
+      active = false;
+      clearInterval(tick);
+      clearInterval(poll);
+    };
+  }, [view, session, eventId, secondsLeftFromScadenza]);
+
+  // (C) Flush CUMULATIVO dei tap durante l'arena (~1s) e all'uscita. registerTaps NON
+  //     somma: inviamo il TOTALE locale corrente; il DB clampa/cappa (anti-cheat).
+  useEffect(() => {
+    if (view !== 'tap' || !session) return;
+    const sessionId = session.sessionId;
+    let lastSent = -1;
+
+    const flush = async () => {
+      const count = tapLocaliRef.current;
+      if (count === lastSent) return; // niente di nuovo da inviare
+      lastSent = count;
+      try {
+        await registerTaps(supabaseRef.current!, { sessionId, count });
+      } catch {
+        // errore transitorio: al prossimo giro reinviamo il cumulativo aggiornato.
+        lastSent = -1;
+      }
+    };
+
+    const timer = setInterval(() => void flush(), TAP_FLUSH_MS);
+    return () => {
+      clearInterval(timer);
+      // flush finale col totale raggiunto (best-effort; il conteggio autoritativo è nel DB).
+      void flush();
+    };
+  }, [view, session]);
+
+  // (D) Esito: appena i ticket vengono assegnati (close_session del regista) il DELTA
+  //     ticket_totali sale sopra lo snapshot "prima" → mostra i ticket guadagnati.
+  //     Se entro CLOSE_WAIT_MS non arriva nulla, esce dal "pending" col delta noto (≥0).
+  useEffect(() => {
+    if (view !== 'esito' || !esitoPending) return;
+    const prima = ticketPrimaRef.current ?? 0;
+    let active = true;
+
+    const resolveNow = () => {
+      if (!active) return;
+      const live = ticketLiveRef.current ?? prima;
+      setEsitoTicket(Math.max(0, live - prima));
+      setEsitoPending(false);
+    };
+
+    // se il delta è già positivo (ticket già assegnati) risolvi subito.
+    const live0 = ticketLiveRef.current ?? prima;
+    if (live0 > prima) {
+      resolveNow();
+      return;
+    }
+
+    // altrimenti attendi che ticketTotali (LIVE via useGuestState) risalga, poi risolvi.
+    const poll = setInterval(() => {
+      if (!active) return;
+      const live = ticketLiveRef.current ?? prima;
+      if (live > prima) resolveNow();
+    }, 500);
+    const timeout = setTimeout(() => {
+      // timeout: mostra comunque l'esito col delta corrente (spesso 0 = nessun ticket).
+      resolveNow();
+    }, CLOSE_WAIT_MS);
+
+    return () => {
+      active = false;
+      clearInterval(poll);
+      clearTimeout(timeout);
+    };
+  }, [view, esitoPending, ticketTotali]);
+
   const seed = guestId ? seedFromId(guestId) : 7;
   const dash = (v: number | null) => (v == null ? '—' : v);
 
@@ -254,6 +450,31 @@ export default function GuestPage() {
   // DrinkRow → MenuItem (sola lettura, nessun ricalcolo). Riferimento eventId per chiarezza.
   void eventId;
   const menuItems: MenuItem[] = drinks.map((d, i) => toMenuItem(d, i));
+
+  // Arena tap (G7): immersivo full-screen, ha priorità (auto-entrato dalla regia).
+  if (view === 'tap') {
+    return (
+      <TapArena
+        secondiRimasti={secondiRimasti}
+        tapLocali={tapLocali}
+        onTap={() => setTapLocali((n) => n + 1)}
+        level={6}
+        seed={seed}
+      />
+    );
+  }
+  // Esito tap (G8): ticket guadagnati = delta ticket_totali dopo close_session.
+  if (view === 'esito') {
+    return (
+      <EsitoTap
+        ticketGuadagnati={esitoTicket}
+        tapTotali={esitoTap}
+        pending={esitoPending}
+        seed={seed}
+        onDone={() => setView('totem')}
+      />
+    );
+  }
 
   if (showQR) {
     return <GuestQR name={nome ?? ''} pin={pin ?? '----'} onBack={() => setShowQR(false)} />;
