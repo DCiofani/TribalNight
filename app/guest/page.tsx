@@ -1,23 +1,36 @@
-// TEMP — swappabile quando arriva il design (Claude Design).
+// Schermata OSPITE (spec §10) — design Claude implementato fedelmente.
+// PRESENTAZIONE = componenti screens/*; LOGICA invariata: guestId + useGuestState
+// (RLS + Realtime). Il front-end NON calcola MAI saldi/ticket/livello/fase.
 //
-// Schermata OSPITE (spec §10).
-// PRESENTAZIONE isolata dalla logica: usa solo i primitivi UI e il Totem.
-// Cablaggio M1-S3: dati LIVE da public.guests via useGuestState (RLS + Realtime).
-// Cablaggio guest-menu: MENÙ REALE dal catalogo `drinks` (sole voci visibili) +
-// reazione alla FASE dell'evento. Il front-end NON calcola MAI saldi/ticket/livello/
-// stato: legge la riga/lista/fase dal backend e basta.
+// Cablaggio guest-merge: il MENÙ è REALE (catalogo public.drinks, sole voci visibili
+// all'ospite via listVisibleDrinks) + reagisce alla FASE dell'evento (autoritativa dal
+// server via getCurrentEventState / evento SSE `phase`). DrinkRow → MenuItem qui sotto.
+// I MOVIMENTI restano placeholder (DEMO_TX): non esiste ancora un wrapper storico
+// transazioni per l'ospite (vedi gaps). Nessun dato/somma inventato lato client.
 'use client';
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { Screen, Card, Button, Stat } from '@/components/ui';
-import Totem from '@/components/Totem';
 import { loadGuestId } from '@/lib/guest-session';
 import { useGuestState } from '@/lib/useGuestState';
 import { createClient } from '@/lib/supabase/client';
 import { listVisibleDrinks, type DrinkRow } from '@/lib/rpc';
 import { getCurrentEventState } from '@/lib/events';
 import { USE_API } from '@/lib/backend-mode';
+import GuestHome from '@/components/screens/GuestHome';
+import GuestMenu, { type MenuItem } from '@/components/screens/GuestMenu';
+import GuestMovimenti, { type Tx } from '@/components/screens/GuestMovimenti';
+import GuestQR from '@/components/screens/GuestQR';
+
+// Seed deterministico dall'id ospite → totem stabile per-ospite (SSR-safe).
+function seedFromId(id: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
 
 // Polling leggero del listino (sola lettura). Per l'OSPITE non possiamo usare lo
 // stream SSE dei drink (/api/stream/drinks è gated requireRole cassa/regia/admin →
@@ -26,66 +39,80 @@ import { USE_API } from '@/lib/backend-mode';
 const MENU_POLL_MS = 20000;
 
 // Polling leggero della FASE come fallback: in USE_API la fase arriva in realtime
-// dall'evento `phase` dell'EventSource del guest (stesso stream di useGuestState);
-// in modalità supabase, o se l'EventSource non è disponibile, si rilegge la fase via
-// getCurrentEventState con questo intervallo. La fase resta SEMPRE autoritativa dal DB.
+// dall'evento `phase` dell'EventSource del guest (/api/stream/guest); in modalità
+// supabase, o se l'EventSource non è disponibile, si rilegge via getCurrentEventState
+// con questo intervallo. La fase resta SEMPRE autoritativa dal DB.
 const PHASE_POLL_MS = 15000;
 
-// Etichetta leggibile del tipo di consumazione (presentazionale).
-const TIPO_LABEL: Record<DrinkRow['tipo'], string> = {
-  normale: 'Normale',
-  premium: 'Premium',
-};
+// Tag presentazionali (colori del mockup DEMO). NB: il tag indica il TIPO di
+// consumazione richiesto, NON un prezzo (il front-end non calcola nulla). Oggi tutte
+// le voci richiedono 1 gettone del proprio tipo; un eventuale "GRATIS" arriverà dal
+// modello dati quando esisterà (vedi gaps), qui non lo inventiamo.
+const TAG_PREMIUM = { tag: '1 PREMIUM', tagColor: '#9BB6EC', tagBorder: '#D89A3E' };
+const TAG_NORMALE = { tag: '1 NORMALE', tagColor: '#D8C3A6', tagBorder: '#43291A' };
+
+// Palette di gradienti del mockup, assegnata in modo deterministico per dare a ogni
+// voce un thumbnail coerente col design. Puramente estetico (nessun dato).
+const SWATCHES = [
+  'linear-gradient(135deg,#7A2E1E,#C2451F)',
+  'linear-gradient(135deg,#C2451F,#F2B43C)',
+  'linear-gradient(135deg,#7A5A1E,#E0A23C)',
+  'linear-gradient(135deg,#C2551F,#F5C451)',
+  'linear-gradient(135deg,#2A4A3A,#3FAE6B)',
+];
+
+// Swatch deterministico: i premium usano i toni più "blu/ricchi" in cima alla lista,
+// i normali ruotano sui toni ambra/verde. Stabile per nome (no flicker tra refetch).
+function swatchFor(d: DrinkRow, idx: number): string {
+  if (d.tipo === 'premium') return SWATCHES[0];
+  return SWATCHES[1 + (idx % (SWATCHES.length - 1))];
+}
+
+// DrinkRow (DB) → MenuItem (presentazione). Sola lettura: nessun ricalcolo.
+function toMenuItem(d: DrinkRow, idx: number): MenuItem {
+  const tag = d.tipo === 'premium' ? TAG_PREMIUM : TAG_NORMALE;
+  return {
+    name: d.nome,
+    desc: d.descrizione || d.categoria || '',
+    swatch: swatchFor(d, idx),
+    ...tag,
+  };
+}
 
 // Copy del banner per fase non-APERTA. La fase NON viene mai ricalcolata: arriva dal
-// server (getCurrentEventState / evento SSE `phase`). SETUP/APERTA non mostrano banner.
-const PHASE_BANNER: Record<string, { titolo: string; testo: string }> = {
-  LAST_CALL: {
-    titolo: 'Last call',
-    testo: 'Il bar è chiuso. È il momento di convertire il credito residuo in ticket.',
-  },
-  ESTRAZIONE: {
-    titolo: 'Estrazione in corso',
-    testo: 'Tieni pronto il tuo PIN: si estraggono i vincitori.',
-  },
-  CHIUSA: {
-    titolo: 'Evento concluso',
-    testo: 'Grazie per aver partecipato. Lo stato qui sotto è quello finale.',
-  },
+// server. SETUP/APERTA non mostrano avviso (bar aperto).
+const PHASE_NOTICE: Record<string, string> = {
+  LAST_CALL: 'Last call: il bar è chiuso. È il momento di convertire il credito residuo in ticket.',
+  ESTRAZIONE: 'Estrazione in corso: il bar è chiuso. Tieni pronto il tuo PIN.',
+  CHIUSA: 'Evento concluso: il bar è chiuso. Lo stato qui sotto è quello finale.',
 };
 
-// Spezza il PIN in 4 caselle; "—" finché non c'è il valore.
-function pinDigits(pin: string | null): string[] {
-  const base = (pin ?? '').slice(0, 4).split('');
-  while (base.length < 4) base.push('—');
-  return base;
-}
+// Movimenti reali: NON esiste (ancora) un wrapper storico transazioni per l'ospite.
+// Lasciamo i dati placeholder in stile design — vedi gaps. Nessuna somma inventata.
+const DEMO_TX: Tx[] = [
+  { icon: '🍸', iconBg: '#22315C', label: 'Negroni Tribale', time: '23:14', delta: '−1 premium', deltaColor: '#9BB6EC' },
+  { icon: '🥃', iconBg: '#3A2414', label: 'Birra alla spina', time: '22:58', delta: '−1 normale', deltaColor: '#D8C3A6' },
+  { icon: '⬆', iconBg: '#2A4A3A', label: 'Ricarica cassa', time: '22:30', delta: '+5 normali', deltaColor: '#34D399' },
+  { icon: '🎟', iconBg: '#3A2A14', label: 'Ticket serata', time: '22:30', delta: '+12 ticket', deltaColor: '#F2B43C' },
+  { icon: '🍸', iconBg: '#22315C', label: 'Spritz Savana', time: '22:05', delta: '−1 normale', deltaColor: '#D8C3A6' },
+  { icon: '🥃', iconBg: '#3A2414', label: 'Mezcal Ember', time: '21:40', delta: '−1 premium', deltaColor: '#9BB6EC' },
+];
+
+type View = 'totem' | 'menu' | 'movimenti';
 
 export default function GuestPage() {
   const router = useRouter();
-
-  // guestId letto SOLO lato client (evita mismatch SSR): parte da undefined,
-  // diventa string|null dopo il mount.
   const [guestId, setGuestId] = useState<string | null | undefined>(undefined);
+  const [view, setView] = useState<View>('totem');
+  const [showQR, setShowQR] = useState(false);
 
   useEffect(() => {
     const id = loadGuestId();
-    if (!id) {
-      // Ospite non registrato: torna all'onboarding.
-      router.replace('/onboarding');
-    }
+    if (!id) router.replace('/onboarding');
     setGuestId(id);
   }, [router]);
 
-  // Wallet (saldi/ticket/livello/PIN) — LIVE, sola lettura, invariato.
-  const {
-    pin,
-    saldoNormale,
-    saldoPremium,
-    ticketTotali,
-    livelloTotem,
-    error,
-  } = useGuestState(guestId ?? null);
+  const { nome, pin, saldoNormale, saldoPremium, ticketTotali, livelloTotem } = useGuestState(guestId ?? null);
 
   // ── Evento corrente: id + fase (autoritativi dal server) ──────────────────
   const [eventId, setEventId] = useState<string | null>(null);
@@ -93,33 +120,24 @@ export default function GuestPage() {
 
   // ── Menù reale (sole voci visibili all'ospite) ────────────────────────────
   const [drinks, setDrinks] = useState<DrinkRow[]>([]);
-  const [menuLoading, setMenuLoading] = useState(true);
-  const [menuError, setMenuError] = useState(false);
 
-  // Istanza supabase stabile per i wrapper (in API mode i wrapper non la usano,
-  // ma la firma la richiede). useRef così non si ricrea ad ogni render.
+  // Istanza supabase stabile per i wrapper (in API mode i wrapper non la usano, ma la
+  // firma la richiede). useRef così non si ricrea ad ogni render.
   const supabaseRef = useRef<ReturnType<typeof createClient> | null>(null);
   if (supabaseRef.current === null) {
     supabaseRef.current = createClient();
   }
 
   // Refetch del listino: SOLA LETTURA via wrapper (branch USE_API già dentro).
-  const refetchMenu = useCallback(
-    async (evId: string, signal: () => boolean) => {
-      try {
-        const list = await listVisibleDrinks(supabaseRef.current!, { eventId: evId });
-        if (!signal()) return;
-        setDrinks(list);
-        setMenuError(false);
-        setMenuLoading(false);
-      } catch {
-        if (!signal()) return;
-        setMenuError(true);
-        setMenuLoading(false);
-      }
-    },
-    [],
-  );
+  const refetchMenu = useCallback(async (evId: string, signal: () => boolean) => {
+    try {
+      const list = await listVisibleDrinks(supabaseRef.current!, { eventId: evId });
+      if (!signal()) return;
+      setDrinks(list);
+    } catch {
+      // Errore transitorio: non azzeriamo il menù noto; ritenta al prossimo giro.
+    }
+  }, []);
 
   // Refetch della fase (autoritativa dal server) — usato all'avvio e dal polling.
   const refetchPhase = useCallback(async (signal: () => boolean) => {
@@ -131,17 +149,16 @@ export default function GuestPage() {
         setFase(state.fase);
       }
     } catch {
-      // Errore transitorio: non azzeriamo la fase nota; ritenta al prossimo giro.
+      // Errore transitorio: la fase nota resta valida; ritenta al prossimo giro.
     }
   }, []);
 
-  // Effetto: risoluzione evento + caricamento menù + polling leggero del menù.
+  // Effetto: risoluzione evento + caricamento menù + polling blando del menù.
   // Niente stream drinks per l'ospite (gated cassa/regia/admin → 403): polling blando.
   useEffect(() => {
     if (!guestId) return;
     let active = true;
     const isActive = () => active;
-
     let menuTimer: ReturnType<typeof setInterval> | null = null;
 
     (async () => {
@@ -158,11 +175,7 @@ export default function GuestPage() {
       } catch {
         // Nessun evento risolto: il menù resta vuoto, lo stato wallet continua a vivere.
       }
-
-      if (!evId) {
-        if (active) setMenuLoading(false);
-        return;
-      }
+      if (!evId) return;
 
       // 2) Carica subito il listino visibile e avvia il polling blando.
       await refetchMenu(evId, isActive);
@@ -180,9 +193,8 @@ export default function GuestPage() {
 
   // Effetto: FASE in realtime.
   //   • USE_API: EventSource phase-only sullo stream del guest (evento `phase`).
-  //     È una connessione separata da quella di useGuestState (che non espone la
-  //     fase): leggiamo solo l'evento `phase`, ignorando `state`. Fallback a polling
-  //     se EventSource non è disponibile.
+  //     Connessione separata da quella di useGuestState (che non espone la fase):
+  //     leggiamo solo `phase`. Fallback a polling se EventSource non è disponibile.
   //   • supabase (o fallback): polling leggero di getCurrentEventState.
   // In OGNI caso la fase è autoritativa dal server: qui non si ricalcola nulla.
   useEffect(() => {
@@ -205,8 +217,6 @@ export default function GuestPage() {
         es = new EventSource('/api/stream/guest?guest=' + encodeURIComponent(guestId), {
           withCredentials: true,
         });
-        // Solo l'evento `phase`: { fase } dal server. Niente refetch del wallet
-        // qui (lo gestisce useGuestState sulla SUA connessione `state`).
         es.addEventListener('phase', (ev) => {
           if (!active) return;
           try {
@@ -216,7 +226,6 @@ export default function GuestPage() {
             // Payload inatteso: ignora, la fase nota resta valida.
           }
         });
-        // Se lo stream cade, degrada al polling (la fase non deve restare stale).
         es.onerror = () => {
           if (!active) return;
           startPolling();
@@ -235,208 +244,51 @@ export default function GuestPage() {
     };
   }, [guestId, refetchPhase]);
 
-  const pin4 = pinDigits(pin);
-  const banner = fase ? PHASE_BANNER[fase] : undefined;
-  const barChiuso = fase === 'LAST_CALL' || fase === 'ESTRAZIONE' || fase === 'CHIUSA';
+  const seed = guestId ? seedFromId(guestId) : 7;
+  const dash = (v: number | null) => (v == null ? '—' : v);
+
+  // Bar chiuso se la fase NON è APERTA (né SETUP): avviso + voci attenuate nel menù.
+  const barChiuso = fase != null && fase !== 'APERTA' && fase !== 'SETUP';
+  const menuNotice = fase ? PHASE_NOTICE[fase] ?? null : null;
+
+  // DrinkRow → MenuItem (sola lettura, nessun ricalcolo). Riferimento eventId per chiarezza.
+  void eventId;
+  const menuItems: MenuItem[] = drinks.map((d, i) => toMenuItem(d, i));
+
+  if (showQR) {
+    return <GuestQR name={nome ?? ''} pin={pin ?? '----'} onBack={() => setShowQR(false)} />;
+  }
+  if (view === 'menu') {
+    return (
+      <GuestMenu
+        items={menuItems}
+        notice={barChiuso ? menuNotice : null}
+        onBack={() => setView('totem')}
+      />
+    );
+  }
+  if (view === 'movimenti') {
+    return (
+      <GuestMovimenti
+        ticket={dash(ticketTotali)}
+        consumazioni={`${saldoNormale ?? 0}N · ${saldoPremium ?? 0}P`}
+        tx={DEMO_TX}
+        onBack={() => setView('totem')}
+      />
+    );
+  }
 
   return (
-    <Screen kicker="Ospite" title="Il tuo Totem">
-      {/* Banner di FASE: appare per LAST_CALL / ESTRAZIONE / CHIUSA. Stato dal server. */}
-      {banner && (
-        <Card style={{ marginBottom: 12, borderColor: 'var(--ember)' }}>
-          <p className="tag" style={{ marginBottom: 4 }}>
-            {banner.titolo}
-          </p>
-          <p style={{ margin: 0, fontSize: 14, color: 'var(--ink-0)' }}>
-            {banner.testo}
-          </p>
-        </Card>
-      )}
-
-      {/* Eroe centrale: livello autoritativo da livello_totem (DB), 0 in attesa. */}
-      <Totem level={livelloTotem ?? 0} />
-
-      {error && (
-        <Card style={{ marginTop: 12, borderColor: 'var(--ember)' }}>
-          <p style={{ margin: 0, fontSize: 14, color: 'var(--ink-0)' }}>
-            Impossibile caricare lo stato.
-          </p>
-        </Card>
-      )}
-
-      {/* Saldi: due tile affiancate (Normali / Premium). Solo lettura. */}
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: '1fr 1fr',
-          gap: 12,
-          marginTop: 8,
-        }}
-      >
-        <Stat label="Saldo Normali" value={saldoNormale ?? '—'} tone="normale" />
-        <Stat label="Saldo Premium" value={saldoPremium ?? '—'} tone="premium" />
-      </div>
-
-      {/* Ticket totali: tile a larghezza piena (GENERATED lato DB). */}
-      <div style={{ marginTop: 12 }}>
-        <Stat label="Ticket totali" value={ticketTotali ?? '—'} tone="normale" />
-      </div>
-
-      {/* Blocco "Mostra alla cassa": QR placeholder + PIN. */}
-      <Card style={{ marginTop: 16 }}>
-        <p className="tag">Mostra alla cassa</p>
-        <h2 style={{ fontSize: 18, margin: '4px 0 12px' }}>Il tuo codice</h2>
-
-        <div
-          style={{
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            gap: 16,
-          }}
-        >
-          {/* QR firmato = TODO(M2/M3), fuori scope: resta placeholder. */}
-          <div
-            role="img"
-            aria-label="Codice QR non ancora disponibile"
-            style={{
-              width: 180,
-              height: 180,
-              borderRadius: 12,
-              border: '1px dashed var(--night-700)',
-              background: 'var(--night-800)',
-              color: 'var(--ink-300)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              textAlign: 'center',
-              fontSize: 13,
-              padding: 12,
-            }}
-          >
-            QR in arrivo
-          </div>
-
-          {/* PIN cassa: 4 caselle. Valore reale dalla propria riga (RLS-ok). */}
-          <div style={{ width: '100%' }}>
-            <p className="tag" style={{ marginBottom: 8 }}>
-              PIN cassa
-            </p>
-            <div
-              role="group"
-              aria-label="PIN cassa"
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(4, 1fr)',
-                gap: 8,
-              }}
-            >
-              {pin4.map((cifra, i) => (
-                <div
-                  key={i}
-                  aria-hidden="true"
-                  style={{
-                    aspectRatio: '1 / 1',
-                    borderRadius: 12,
-                    border: '1px solid var(--night-700)',
-                    background: 'var(--night-800)',
-                    color: 'var(--ink-0)',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    fontSize: 28,
-                    fontWeight: 700,
-                  }}
-                >
-                  {cifra}
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      </Card>
-
-      {/* Menù REALE: sole voci visibili all'ospite (listVisibleDrinks). Sola lettura. */}
-      <section style={{ marginTop: 16 }}>
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            marginBottom: 8,
-          }}
-        >
-          <p className="tag" style={{ margin: 0 }}>
-            Menù
-          </p>
-          {barChiuso && (
-            <span className="tag" style={{ color: 'var(--ember)' }}>
-              Bar chiuso
-            </span>
-          )}
-        </div>
-
-        {menuLoading ? (
-          <Card>
-            <p style={{ margin: 0, fontSize: 14, color: 'var(--ink-300)' }}>
-              Carico il menù…
-            </p>
-          </Card>
-        ) : menuError ? (
-          <Card style={{ borderColor: 'var(--ember)' }}>
-            <p style={{ margin: 0, fontSize: 14, color: 'var(--ink-0)' }}>
-              Impossibile caricare il menù.
-            </p>
-          </Card>
-        ) : drinks.length === 0 ? (
-          <Card>
-            <p style={{ margin: 0, fontSize: 14, color: 'var(--ink-300)' }}>
-              Nessuna voce disponibile al momento.
-            </p>
-          </Card>
-        ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {drinks.map((d) => (
-              <Card
-                key={d.id}
-                style={{
-                  display: 'flex',
-                  alignItems: 'flex-start',
-                  justifyContent: 'space-between',
-                  gap: 12,
-                  // In LAST_CALL/ESTRAZIONE/CHIUSA il bar è OFF: menù presentazionale
-                  // attenuato (l'ospite converte il credito, non ordina). Stato dal server.
-                  opacity: barChiuso ? 0.55 : 1,
-                }}
-              >
-                <div style={{ minWidth: 0 }}>
-                  <div style={{ color: 'var(--ink-0)', fontWeight: 600 }}>{d.nome}</div>
-                  {d.categoria && (
-                    <div style={{ fontSize: 12, color: 'var(--ink-300)', marginTop: 2 }}>
-                      {d.categoria}
-                    </div>
-                  )}
-                  {d.descrizione && (
-                    <div style={{ fontSize: 13, color: 'var(--ink-300)', marginTop: 4 }}>
-                      {d.descrizione}
-                    </div>
-                  )}
-                </div>
-                <span className="tag" style={{ flexShrink: 0 }}>
-                  {TIPO_LABEL[d.tipo]}
-                </span>
-              </Card>
-            ))}
-          </div>
-        )}
-      </section>
-
-      {/* Azione segnaposto: lo stato si aggiorna da solo via Realtime/polling. */}
-      <div style={{ marginTop: 16 }}>
-        <Button variant="ghost" disabled>
-          Aggiorna stato
-        </Button>
-      </div>
-    </Screen>
+    <GuestHome
+      name={nome ?? ''}
+      ticket={dash(ticketTotali)}
+      normali={dash(saldoNormale)}
+      premium={dash(saldoPremium)}
+      level={livelloTotem ?? 0}
+      seed={seed}
+      active="totem"
+      onShowCassa={() => setShowQR(true)}
+      onNav={(t) => setView(t)}
+    />
   );
 }

@@ -1,26 +1,37 @@
+@import url('https://fonts.googleapis.com/css2?family=Anton&family=Cinzel:wght@500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
 :root {
-  /* ── Brand (PLACEHOLDER, vincolo 5 — sostituibile senza toccare logica/dati) ── */
-  --eden-violet: #7a4dff;
-  --eden-indigo: #4f46e5;
-  --eden-lavender: #a78bfa;
+  /* ── Brand TRIBAL NIGHT (palette africana calda) ──
+     Stessi NOMI dei token precedenti: i componenti restano invariati,
+     cambia solo il VALORE. --eden-* = accenti primari, --night-* = superfici. */
+  --eden-violet: #e0552a; /* primario (ember-terracotta): CTA, totem core */
+  --eden-indigo: #3a5bbe; /* premium / azioni "serie" */
+  --eden-lavender: #e8a23c; /* glow, link, focus, aura totem */
 
-  /* Notte (sfondi) */
-  --night-900: #0a0a12;
-  --night-800: #14111f;
-  --night-700: #1e1a2e;
+  /* Notte calda (sfondi roasted) */
+  --night-900: #190f08; /* base */
+  --night-800: #2c1b12; /* card / pannelli */
+  --night-700: #43291a; /* bordi / divisori */
+  --night-650: #160c06; /* base più profonda (gradienti) */
 
-  /* Testo */
-  --ink-0: #ffffff;
-  --ink-300: #c9c4db;
+  /* Testo (caldo) */
+  --ink-0: #fcefe0;
+  --ink-300: #d8c3a6;
+  --ink-500: #a58a66;
 
   /* Accenti tribali / ricompensa */
-  --ember: #ff7a3c;
+  --ember: #ee6321;
   --gold: #f5c451;
-  --success: #34d399;
-  --danger: #fb7185;
+  --success: #3fae6b;
+  --danger: #e5604f;
 
-  /* Gradiente totem (come il logo) */
-  --totem-grad: radial-gradient(circle at 50% 35%, #a78bfa 0%, #7a4dff 45%, #4f46e5 100%);
+  /* Gradiente totem (fuoco: oro → ember → profondo) */
+  --totem-grad: radial-gradient(circle at 50% 32%, #f5c451 0%, #e0552a 46%, #b23a1e 100%);
+
+  /* Tipografia */
+  --font-display: 'Anton', system-ui, sans-serif; /* titoli d'impatto, countdown */
+  --font-ritual: 'Cinzel', Georgia, serif; /* tagline, livelli, kicker rituali */
+  --font-ui: 'Space Grotesk', ui-sans-serif, system-ui, -apple-system, sans-serif;
 }
 
 * {
@@ -34,9 +45,12 @@ body {
 }
 
 body {
-  background: var(--night-900);
+  background:
+    radial-gradient(120% 80% at 50% -10%, #2c1b12 0%, transparent 60%),
+    var(--night-900);
+  background-attachment: fixed;
   color: var(--ink-0);
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-family: var(--font-ui);
   -webkit-font-smoothing: antialiased;
   min-height: 100dvh;
 }
@@ -45,12 +59,21 @@ body {
 main {
   max-width: 480px;
   margin: 0 auto;
-  padding: 24px 16px;
+  padding: 24px 16px 40px;
 }
 
 h1 {
-  font-size: 28px;
-  margin: 4px 0 8px;
+  font-family: var(--font-display);
+  font-size: 38px;
+  line-height: 0.98;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  margin: 2px 0 14px;
+}
+
+h2 {
+  font-family: var(--font-ui);
+  font-weight: 600;
 }
 
 a {
@@ -59,16 +82,20 @@ a {
 }
 
 .card {
-  background: var(--night-800);
+  background:
+    linear-gradient(180deg, rgba(255, 200, 120, 0.03), transparent 60%),
+    var(--night-800);
   border: 1px solid var(--night-700);
   border-radius: 16px;
   padding: 16px;
 }
 
 .tag {
+  font-family: var(--font-ritual);
+  font-weight: 600;
   font-size: 12px;
-  color: var(--ink-300);
-  letter-spacing: 0.12em;
+  color: var(--ink-500);
+  letter-spacing: 0.28em;
   text-transform: uppercase;
   margin: 0;
 }
@@ -76,6 +103,7 @@ a {
 /* Bottone: hover/active/focus richiedono pseudo-classi (non esprimibili inline) */
 .btn:not(:disabled):hover {
   transform: translateY(-1px);
+  filter: brightness(1.06);
 }
 .btn:not(:disabled):active {
   transform: translateY(0) scale(0.99);
@@ -85,7 +113,7 @@ a {
   outline-offset: 2px;
 }
 
-/* Accessibilità: rispetta la riduzione del movimento (motion totem/tap in arrivo) */
+/* Accessibilità: rispetta la riduzione del movimento */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -96,12 +124,8 @@ a {
   }
 }
 
-/* ════════════ TotemStack — palo di maschere tiki che si "carica" ════════════
-   Componente eroe sostituibile. Le classi .tt-* sono isolate.
-   --tt-fill (0%→100%) = livello di carica (energia che sale dal basso).
-   --tt-glow (0→1)     = intensità aura/glow. Entrambe settate inline dal componente. */
-
-/* Proprietà custom registrata: rende --tt-fill animabile/tweenabile */
+/* ════════════ TotemStack (legacy, ancora usato da app/totem-demo) ════════════
+   Le classi .tt-* restano: ora ereditano la palette calda dai token sopra. */
 @property --tt-fill {
   syntax: '<percentage>';
   inherits: true;
@@ -118,8 +142,6 @@ a {
   transition: --tt-fill 0.7s cubic-bezier(0.16, 1, 0.3, 1);
   user-select: none;
 }
-
-/* carica automatica (splash S1): l'energia sale in loop */
 .tt--loading {
   animation: tt-charge 2.6s ease-in-out infinite;
 }
@@ -128,8 +150,6 @@ a {
   65% { --tt-fill: 100%; }
   100% { --tt-fill: 100%; }
 }
-
-/* alone radiale viola dietro al totem, pulsa lento */
 .tt-glow {
   position: absolute;
   left: 50%;
@@ -137,7 +157,7 @@ a {
   width: 130%;
   height: 130%;
   transform: translate(-50%, -50%);
-  background: radial-gradient(circle, var(--eden-violet) 0%, transparent 62%);
+  background: radial-gradient(circle, var(--ember) 0%, transparent 62%);
   opacity: var(--tt-glow);
   filter: blur(10px);
   pointer-events: none;
@@ -148,8 +168,6 @@ a {
   0%, 100% { transform: translate(-50%, -50%) scale(1); }
   50% { transform: translate(-50%, -50%) scale(1.07); }
 }
-
-/* anelli tribali concentrici */
 .tt-ring {
   position: absolute;
   left: 50%;
@@ -160,8 +178,6 @@ a {
   pointer-events: none;
   transition: opacity 0.5s ease;
 }
-
-/* palco 3D-soft: galleggia e ondeggia leggermente (pseudo-profondità) */
 .tt-stage {
   position: relative;
   transform-style: preserve-3d;
@@ -171,10 +187,7 @@ a {
   0%, 100% { transform: translateY(0) rotateX(5deg) rotateY(-3.5deg); }
   50% { transform: translateY(-10px) rotateX(5deg) rotateY(3.5deg); }
 }
-
-/* il palo: contiene i due stack identici (base spenta + lit accesa) */
 .tt-pole { position: relative; }
-
 .tt-stack {
   display: flex;
   flex-direction: column;
@@ -185,13 +198,9 @@ a {
   height: auto;
   -webkit-user-drag: none;
 }
-
-/* layer base: maschere dormienti (dim + leggermente desaturate, NON grigio morto) */
 .tt-stack--base .tt-seg {
   filter: brightness(0.46) saturate(0.55);
 }
-
-/* layer acceso: pieno colore + glow viola, rivelato dal basso fino a --tt-fill */
 .tt-stack--lit {
   position: absolute;
   inset: 0;
@@ -203,10 +212,8 @@ a {
   );
 }
 .tt-stack--lit .tt-seg {
-  filter: drop-shadow(0 0 9px var(--eden-violet)) saturate(1.12);
+  filter: drop-shadow(0 0 9px var(--ember)) saturate(1.12);
 }
-
-/* linea d'energia all'altezza della carica */
 .tt-energy {
   position: absolute;
   left: -8%;
@@ -221,8 +228,6 @@ a {
   opacity: calc(var(--tt-glow) * 0.9);
   pointer-events: none;
 }
-
-/* scintille d'ambra/oro ai livelli alti, salgono e svaniscono */
 .tt-spark {
   position: absolute;
   top: 6%;
@@ -237,8 +242,6 @@ a {
   30% { opacity: 1; }
   100% { transform: translateY(-46px) scale(1); opacity: 0; }
 }
-
-/* anello di caricamento (splash) */
 .tt-loader {
   margin-top: 10px;
   transform: rotate(-90deg);

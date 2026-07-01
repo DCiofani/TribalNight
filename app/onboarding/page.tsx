@@ -1,17 +1,22 @@
-// TEMP — swappabile quando arriva il design (Claude Design).
-// Schermata Ospite / onboarding §7.1 — presentazione isolata dalla logica.
-// Cablaggio M1-S3: anon sign-in -> register_guest (current_event) -> persisti
+// Schermata Ospite / onboarding §7.1 — design Claude implementato fedelmente.
+// LOGICA invariata: anon sign-in -> register_guest (current_event) -> persisti
 // guestId in localStorage -> /guest. Nessun ricalcolo: la riga guests è autoritativa.
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useRef, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import { Screen, Card, Button, Stat } from '@/components/ui';
-import Totem from '@/components/Totem';
+import Onboarding from '@/components/screens/Onboarding';
 import { createClient } from '@/lib/supabase/client';
 import { USE_API } from '@/lib/backend-mode';
 import { registerGuest, RpcError } from '@/lib/rpc';
 import { saveGuestId } from '@/lib/guest-session';
+
+// Livello d'apice dell'animazione rituale (il Totem ha 6 livelli — vedi components/Totem.tsx).
+const IGNITE_PEAK = 6;
+// Cadenza fra un livello e il successivo: 0→6 a step di ~300ms ≈ ~1.8s totali (+ una pausa
+// finale a livello pieno prima di navigare). Resta nella finestra richiesta di ~1.6–2.2s.
+const IGNITE_STEP_MS = 300;
+const IGNITE_HOLD_MS = 360;
 
 export default function OnboardingPage() {
   const router = useRouter();
@@ -20,8 +25,52 @@ export default function OnboardingPage() {
   const [submitting, setSubmitting] = useState(false);
   const [errore, setErrore] = useState<string | null>(null);
 
+  // Fase d'accensione: 'igniting' attiva l'overlay rituale; 'igniteLevel' fa salire il Totem.
+  const [igniting, setIgniting] = useState(false);
+  const [igniteLevel, setIgniteLevel] = useState(0);
+  // Tracciamo i timer per ripulirli in caso di smontaggio durante l'animazione.
+  const timersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+
+  const prefersReducedMotion = useCallback(
+    () =>
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+    [],
+  );
+
+  // Riproduce l'accensione (Totem 0→6) poi naviga. Rispetta prefers-reduced-motion:
+  // se attivo salta la rampa e va subito a /guest.
+  const playIgniteThenGo = useCallback(() => {
+    setIgniting(true);
+
+    if (prefersReducedMotion()) {
+      setIgniteLevel(IGNITE_PEAK);
+      router.push('/guest');
+      return;
+    }
+
+    for (let lvl = 1; lvl <= IGNITE_PEAK; lvl++) {
+      const t = setTimeout(() => setIgniteLevel(lvl), lvl * IGNITE_STEP_MS);
+      timersRef.current.push(t);
+    }
+    const go = setTimeout(
+      () => router.push('/guest'),
+      IGNITE_PEAK * IGNITE_STEP_MS + IGNITE_HOLD_MS,
+    );
+    timersRef.current.push(go);
+  }, [prefersReducedMotion, router]);
+
+  React.useEffect(
+    () => () => {
+      timersRef.current.forEach(clearTimeout);
+    },
+    [],
+  );
+
   const nomeValido = nome.trim().length > 0;
-  const puoEntrare = nomeValido && accettato && !submitting;
+  // Durante l'accensione il form è bloccato (igniting) per evitare doppi submit.
+  const puoEntrare = nomeValido && accettato && !submitting && !igniting;
 
   async function handleEntra(e: React.FormEvent) {
     e.preventDefault();
@@ -39,17 +88,14 @@ export default function OnboardingPage() {
       if (USE_API) {
         // Path API (backend nuovo): identità anonima emessa dal server con cookie
         // di sessione HttpOnly. POST /api/auth/anon -> { sub }; il cookie viaggia
-        // grazie a credentials:'include'. Idempotenza non necessaria: una seconda
-        // identità anonima non perde la riga guests finché il guestId è persistito.
+        // grazie a credentials:'include'.
         const res = await fetch('/api/auth/anon', {
           method: 'POST',
           credentials: 'include',
           headers: { Accept: 'application/json' },
         });
         if (!res.ok) {
-          throw new RpcError('Sign-in anonimo non riuscito', {
-            code: String(res.status),
-          });
+          throw new RpcError('Sign-in anonimo non riuscito', { code: String(res.status) });
         }
       } else {
         // Path supabase (default): sessione anonima idempotente, firma solo se assente.
@@ -61,13 +107,14 @@ export default function OnboardingPage() {
       }
 
       // register_guest risolve l'evento corrente internamente (current_event()).
-      // Wrapper unico: in API mode chiama POST /api/guest/register, altrimenti la RPC.
       const guest = await registerGuest(supabase, nome);
 
       // Persisti SOLO l'id (puntatore). PIN/saldi NON vanno in localStorage.
       saveGuestId(guest.id);
 
-      router.push('/guest');
+      // SUCCESSO: invece di navigare subito, riproduci l'accensione rituale del Totem
+      // (level 0→6) e POI vai a /guest. La registrazione è già avvenuta e l'id è persistito.
+      playIgniteThenGo();
     } catch (err) {
       if (err instanceof RpcError && err.code === 'NO_EVENT') {
         setErrore('Nessun evento attivo. Riprova più tardi.');
@@ -81,114 +128,17 @@ export default function OnboardingPage() {
   }
 
   return (
-    <Screen kicker="Totem Night" title="Benvenuto">
-      {/* Totem isolato/sostituibile — livello demo statico (placeholder) */}
-      <Card style={{ display: 'flex', justifyContent: 'center', marginBottom: 16 }}>
-        <Totem level={0} />
-      </Card>
-
-      <form onSubmit={handleEntra} noValidate>
-        <Card style={{ marginBottom: 16 }}>
-          <label
-            htmlFor="guest-nome"
-            className="tag"
-            style={{ display: 'block', marginBottom: 8 }}
-          >
-            Nome
-          </label>
-          <input
-            id="guest-nome"
-            name="nome"
-            type="text"
-            inputMode="text"
-            autoComplete="given-name"
-            required
-            placeholder="Come ti chiami?"
-            value={nome}
-            onChange={(e) => setNome(e.target.value)}
-            aria-required="true"
-            style={{
-              width: '100%',
-              padding: '14px 12px',
-              fontSize: 16,
-              color: 'var(--ink-0)',
-              background: 'var(--night-900)',
-              border: '1px solid var(--night-700)',
-              borderRadius: 12,
-              outline: 'none',
-            }}
-          />
-
-          <label
-            htmlFor="guest-tos"
-            style={{
-              display: 'flex',
-              alignItems: 'flex-start',
-              gap: 10,
-              marginTop: 16,
-              fontSize: 14,
-              color: 'var(--ink-300)',
-              lineHeight: 1.4,
-              cursor: 'pointer',
-            }}
-          >
-            <input
-              id="guest-tos"
-              name="tos"
-              type="checkbox"
-              checked={accettato}
-              onChange={(e) => setAccettato(e.target.checked)}
-              aria-required="true"
-              style={{ marginTop: 2, width: 18, height: 18, accentColor: 'var(--eden-violet)', flex: '0 0 auto' }}
-            />
-            <span>
-              Ho letto e accetto i{' '}
-              <a href="/terms" target="_blank" rel="noopener noreferrer">
-                Termini &amp; Condizioni
-              </a>
-              .
-            </span>
-          </label>
-        </Card>
-
-        {/* Errore inline — riusa la Card con accento ember (no dettagli RLS all'utente). */}
-        {errore && (
-          <Card style={{ marginBottom: 16, borderColor: 'var(--ember)' }}>
-            <p style={{ margin: 0, fontSize: 14, color: 'var(--ink-0)' }}>{errore}</p>
-          </Card>
-        )}
-
-        <Button type="submit" variant="primary" disabled={!puoEntrare}>
-          {submitting ? 'Entro…' : 'Entra'}
-        </Button>
-      </form>
-
-      {/* Anteprima credito serata — placeholder statici, MAI ricalcolati nel client */}
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: '1fr 1fr',
-          gap: 12,
-          marginTop: 16,
-        }}
-      >
-        {/* TODO(RPC): saldo reale da get_guest_balance / Realtime (M2/M3) */}
-        <Stat label="Credito" value="—" tone="normale" />
-        {/* TODO(RPC): ticket reali da get_guest_tickets / Realtime (M2/M3) */}
-        <Stat label="Ticket" value={0} tone="normale" />
-      </div>
-
-      <Card style={{ marginTop: 16 }}>
-        <p className="tag" style={{ marginBottom: 6 }}>
-          Prossimo passo
-        </p>
-        <p style={{ margin: 0, fontSize: 14, color: 'var(--ink-300)', lineHeight: 1.5 }}>
-          Dopo l&apos;accesso ti verrà generato un{' '}
-          <strong style={{ color: 'var(--ink-0)' }}>PIN / QR</strong> personale per
-          ricevere crediti e ticket durante la serata.
-          {/* TODO(RPC): PIN/QR generati lato server dopo register_guest (M2/M3). */}
-        </p>
-      </Card>
-    </Screen>
+    <Onboarding
+      nome={nome}
+      onNome={setNome}
+      accettato={accettato}
+      onAccettato={setAccettato}
+      submitting={submitting}
+      errore={errore}
+      canSubmit={puoEntrare}
+      onSubmit={handleEntra}
+      igniting={igniting}
+      igniteLevel={igniteLevel}
+    />
   );
 }
