@@ -13,10 +13,25 @@ import { saveGuestId } from '@/lib/guest-session';
 
 // Livello d'apice dell'animazione rituale (il Totem ha 6 livelli — vedi components/Totem.tsx).
 const IGNITE_PEAK = 6;
-// Cadenza fra un livello e il successivo: 0→6 a step di ~300ms ≈ ~1.8s totali (+ una pausa
-// finale a livello pieno prima di navigare). Resta nella finestra richiesta di ~1.6–2.2s.
-const IGNITE_STEP_MS = 300;
-const IGNITE_HOLD_MS = 360;
+// Cadenza fra un livello e il successivo durante la FASE 1 (ignite lento). A ~520ms ogni step
+// innesca il crossfade CSS interno .6s del Totem: i passaggi si sovrappongono leggermente →
+// colori/glow/aura salgono in modo continuo, senza scatti. Non scendere sotto ~500ms.
+const IGNITE_STEP_MS = 520;
+
+// Marker temporali assoluti (ms dall'avvio della coreografia) delle fasi successive all'ignite.
+// IGNITE: 6 × 520 = 3120ms. Poi picco vivo, decolor, reveal in stagger, handoff fluido.
+const T_PEAK = 3120; // FASE 2 — picco: il Totem resta a 6 e pulsa (animazioni interne infinite).
+const T_DECOLOR = 4020; // FASE 3 — decolor: salto 6→1, il crossfade .6s del Totem lo "spegne".
+const T_REVEAL = 4780; // FASE 4 — reveal: spuntano gli elementi di scena in stagger.
+const T_HANDOFF = 5980; // FASE 5 — handoff: l'overlay fa fade-out.
+const T_PUSH = 6240; // router.push a metà del fade → crossfade percepito con /guest.
+const T_FAILSAFE = 6600; // FAILSAFE: forza la navigazione se per qualsiasi motivo non è avvenuta.
+
+// Ramo reduced-motion: mostra il Totem già acceso + reveal statico, poi naviga subito.
+const REDUCED_HOLD_MS = 600;
+
+// Macchina a fasi della coreografia rituale (puramente estetica, parte DOPO la registrazione).
+type IgnitePhase = 'idle' | 'ignite' | 'peak' | 'decolor' | 'reveal' | 'handoff';
 
 export default function OnboardingPage() {
   const router = useRouter();
@@ -25,11 +40,15 @@ export default function OnboardingPage() {
   const [submitting, setSubmitting] = useState(false);
   const [errore, setErrore] = useState<string | null>(null);
 
-  // Fase d'accensione: 'igniting' attiva l'overlay rituale; 'igniteLevel' fa salire il Totem.
-  const [igniting, setIgniting] = useState(false);
+  // Fase d'accensione: 'ignitePhase' pilota l'overlay rituale; 'igniteLevel' fa salire il Totem.
+  // 'igniting' è derivato: l'overlay è attivo per qualsiasi fase diversa da 'idle'.
+  const [ignitePhase, setIgnitePhase] = useState<IgnitePhase>('idle');
   const [igniteLevel, setIgniteLevel] = useState(0);
+  const igniting = ignitePhase !== 'idle';
   // Tracciamo i timer per ripulirli in caso di smontaggio durante l'animazione.
   const timersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  // Naviga a /guest UNA SOLA volta (push a metà fade + failsafe non devono navigare due volte).
+  const navigatedRef = useRef(false);
 
   const prefersReducedMotion = useCallback(
     () =>
@@ -39,27 +58,50 @@ export default function OnboardingPage() {
     [],
   );
 
-  // Riproduce l'accensione (Totem 0→6) poi naviga. Rispetta prefers-reduced-motion:
-  // se attivo salta la rampa e va subito a /guest.
+  const goGuest = useCallback(() => {
+    if (navigatedRef.current) return;
+    navigatedRef.current = true;
+    router.push('/guest');
+  }, [router]);
+
+  // Riproduce la coreografia rituale a fasi (ignite lento → picco → decolor → reveal → handoff)
+  // e POI naviga a /guest. La registrazione è già avvenuta e l'id è persistito prima di qui.
+  // Rispetta prefers-reduced-motion: mostra il Totem acceso + reveal statico e naviga subito.
   const playIgniteThenGo = useCallback(() => {
-    setIgniting(true);
+    const schedule = (fn: () => void, ms: number) => {
+      timersRef.current.push(setTimeout(fn, ms));
+    };
 
     if (prefersReducedMotion()) {
+      // Ramo ridotto: niente rampa né timer di fase. Totem già al picco, reveal statico,
+      // breve pausa leggibile, poi naviga. Il failsafe copre comunque questo ramo.
+      setIgnitePhase('reveal');
       setIgniteLevel(IGNITE_PEAK);
-      router.push('/guest');
+      schedule(goGuest, REDUCED_HOLD_MS);
+      schedule(goGuest, T_FAILSAFE);
       return;
     }
 
+    // FASE 1 — IGNITE lento: level 1..6 a step di IGNITE_STEP_MS (crossfade .6s sovrapposto).
+    setIgnitePhase('ignite');
     for (let lvl = 1; lvl <= IGNITE_PEAK; lvl++) {
-      const t = setTimeout(() => setIgniteLevel(lvl), lvl * IGNITE_STEP_MS);
-      timersRef.current.push(t);
+      schedule(() => setIgniteLevel(lvl), lvl * IGNITE_STEP_MS);
     }
-    const go = setTimeout(
-      () => router.push('/guest'),
-      IGNITE_PEAK * IGNITE_STEP_MS + IGNITE_HOLD_MS,
-    );
-    timersRef.current.push(go);
-  }, [prefersReducedMotion, router]);
+    // FASE 2 — PEAK: resta a 6, pulsa da solo (animazioni interne infinite del Totem).
+    schedule(() => setIgnitePhase('peak'), T_PEAK);
+    // FASE 3 — DECOLOR: un solo salto 6→1, il crossfade .6s del Totem lo "spegne" con fluidità.
+    schedule(() => {
+      setIgnitePhase('decolor');
+      setIgniteLevel(1);
+    }, T_DECOLOR);
+    // FASE 4 — REVEAL: spuntano gli elementi di scena in stagger (gestiti dall'overlay).
+    schedule(() => setIgnitePhase('reveal'), T_REVEAL);
+    // FASE 5 — HANDOFF: l'overlay fa fade-out; il push parte a metà del fade → crossfade.
+    schedule(() => setIgnitePhase('handoff'), T_HANDOFF);
+    schedule(goGuest, T_PUSH);
+    // FAILSAFE: l'utente non resta MAI bloccato, anche se un timer/render slitta.
+    schedule(goGuest, T_FAILSAFE);
+  }, [prefersReducedMotion, goGuest]);
 
   React.useEffect(
     () => () => {
@@ -139,6 +181,8 @@ export default function OnboardingPage() {
       onSubmit={handleEntra}
       igniting={igniting}
       igniteLevel={igniteLevel}
+      ignitePhase={ignitePhase}
+      reducedMotion={prefersReducedMotion()}
     />
   );
 }

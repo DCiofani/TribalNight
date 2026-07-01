@@ -6,6 +6,11 @@ Tutte le modifiche rilevanti a **Totem Night**. Formato: [Keep a Changelog](http
 
 ## [Unreleased]
 
+### Onboarding — animazione ignite CINEMATICA continua ✅
+- **Workflow multi-agente** (analisi Totem+coreografia → implementazione → review ok). Sostituita la sequenza breve (~2.2s) con una **scena continua ~6.5s**: FASE ignite lento (level 0→6 a 520ms/step, crossfade .6s sovrapposto → fluido) → PICCO in fiamme che pulsa (animazioni interne Totem) → **DECOLOR** (6→1, glow rientra) → **REVEAL** elementi in stagger (anelli tribali che si espandono, pioggia scintille, glifi con overshoot, copy rituale) → **HANDOFF** fluido a /guest (fade overlay + navigate a metà, failsafe). Macchina a fasi (`ignitePhase`), timers puliti su unmount, `prefers-reduced-motion` → versione breve+statica+navigate subito.
+- Totem.tsx NON toccato (pilotato solo via prop `level`). Logica register invariata (registerGuest→saveGuestId→navigate SEMPRE a fine sequenza).
+- ✅ tsc pulito; **verificato a video** sul preview: catturata la fase ignite (overlay + maschere che si accendono dal basso in neon oro), sequenza completa fino a /guest.
+
 ### Polish ✅
 - **Workflow multi-agente** (enabler ∥ → UI ∥ → review ok).
 - **Anteprima conversione (G9)**: `GET /api/guest/convert-preview` + `getConvertPreview` — calcola SERVER-side i ticket risultanti (saldi × tassi `ticket_conversione_normale/premium` dell'evento); Conversione mostra "= +N ticket" (mai calcolato nel client; `convert_credit` resta l'unica scrittura).

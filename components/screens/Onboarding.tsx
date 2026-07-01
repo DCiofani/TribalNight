@@ -5,6 +5,9 @@
 import React from 'react';
 import Totem from '@/components/Totem';
 
+// Fase della coreografia rituale (specchio del type in app/onboarding/page.tsx).
+type IgnitePhase = 'idle' | 'ignite' | 'peak' | 'decolor' | 'reveal' | 'handoff';
+
 type Props = {
   nome: string;
   onNome: (v: string) => void;
@@ -15,18 +18,140 @@ type Props = {
   canSubmit: boolean;
   onSubmit: (e: React.FormEvent) => void;
   // Fase d'accensione rituale (dopo la registrazione, prima di /guest). Presentazionale:
-  // il livello che sale arriva dalla page, qui lo mostriamo soltanto.
+  // il livello che sale e la fase arrivano dalla page, qui li mostriamo soltanto.
   igniting?: boolean;
   igniteLevel?: number;
+  ignitePhase?: IgnitePhase;
+  // In reduced-motion l'overlay renderizza gli elementi allo stato finale, senza keyframe.
+  reducedMotion?: boolean;
 };
+
+// Ease "expo-out": scatto deciso poi rallentamento — feel "scena di gioco che si assembla".
+const EASE_GAME = 'cubic-bezier(.16,1,.3,1)';
 
 // Keyframe locali per l'overlay rituale (il Totem porta i propri).
 const IGNITE_KEYFRAMES = `
 @keyframes tmx-ignite-veil { from { opacity: 0 } to { opacity: 1 } }
 @keyframes tmx-ignite-rise { 0% { opacity: 0; transform: translateY(10px) } 100% { opacity: 1; transform: translateY(0) } }
+@keyframes tmx-peak-breathe { 0%,100% { opacity: .92 } 50% { opacity: 1 } }
+@keyframes tmx-ring-expand { 0% { transform: translate(-50%,-50%) scale(.2); opacity: 0 } 55% { opacity: .9 } 100% { transform: translate(-50%,-50%) scale(1); opacity: .5 } }
+@keyframes tmx-rain { 0% { transform: translateY(-24px) scale(.4); opacity: 0 } 30% { opacity: 1 } 100% { transform: translateY(40px) scale(1); opacity: 0 } }
+@keyframes tmx-glyph-pop { 0% { transform: scale(.4) rotate(-8deg); opacity: 0 } 70% { transform: scale(1.12) rotate(2deg); opacity: 1 } 100% { transform: scale(1) rotate(0); opacity: .9 } }
+@keyframes tmx-final-copy { 0% { opacity: 0; transform: translateY(14px) } 100% { opacity: 1; transform: translateY(0) } }
+@keyframes tmx-handoff-out { from { opacity: 1 } to { opacity: 0 } }
 `;
 
-function IgniteOverlay({ level }: { level: number }) {
+// 3 anelli tribali concentrici che si espandono dal centro-totem (stesso #F2B43C del ringSvg
+// interno del Totem → sembrano "emanati" dal totem). In reduced: statici, opacità di arrivo.
+const RING_SIZES = [340, 250, 168];
+function RevealRings({ animate }: { animate: boolean }) {
+  return (
+    <>
+      {RING_SIZES.map((d, i) => (
+        <div
+          key={`ring${i}`}
+          aria-hidden="true"
+          style={{
+            position: 'absolute',
+            left: '50%',
+            top: '50%',
+            width: d,
+            height: d,
+            marginLeft: 0,
+            marginTop: 0,
+            borderRadius: '50%',
+            border: '1.5px solid #F2B43C',
+            transform: 'translate(-50%,-50%)',
+            opacity: 0.5,
+            pointerEvents: 'none',
+            animation: animate ? `tmx-ring-expand 700ms ${EASE_GAME} ${i * 120}ms both` : 'none',
+          }}
+        />
+      ))}
+    </>
+  );
+}
+
+// Pioggia di scintille ambra/oro attorno al totem (stagger 200 + i*70ms).
+const RAIN_XS = [12, 26, 40, 52, 63, 74, 84, 20, 33, 68, 88, 47];
+function RevealRain({ animate }: { animate: boolean }) {
+  return (
+    <>
+      {RAIN_XS.map((x, i) => {
+        const gold = i % 2 === 0;
+        return (
+          <span
+            key={`rain${i}`}
+            aria-hidden="true"
+            style={{
+              position: 'absolute',
+              left: `${x}%`,
+              top: `${18 + (i % 4) * 9}%`,
+              width: 4 + (i % 3),
+              height: 4 + (i % 3),
+              borderRadius: '50%',
+              background: gold ? '#F5C24A' : '#EE8A2C',
+              boxShadow: `0 0 8px ${gold ? 'rgba(245,194,74,.9)' : 'rgba(238,138,44,.85)'}`,
+              opacity: animate ? 0 : 0.85,
+              pointerEvents: 'none',
+              animation: animate ? `tmx-rain 900ms ${EASE_GAME} ${200 + i * 70}ms both` : 'none',
+            }}
+          />
+        );
+      })}
+    </>
+  );
+}
+
+// Glifi/rune di scena ai lati con overshoot (stagger 420 + i*110ms).
+const GLYPHS = [
+  { ch: '◈', left: '10%', top: '26%' },
+  { ch: '⟡', left: '88%', top: '34%' },
+  { ch: '❖', left: '14%', top: '70%' },
+  { ch: '✧', left: '84%', top: '72%' },
+];
+function RevealGlyphs({ animate }: { animate: boolean }) {
+  return (
+    <>
+      {GLYPHS.map((g, i) => (
+        <span
+          key={`gly${i}`}
+          aria-hidden="true"
+          style={{
+            position: 'absolute',
+            left: g.left,
+            top: g.top,
+            transform: animate ? undefined : 'scale(1)',
+            fontSize: 22,
+            color: '#F2B43C',
+            textShadow: '0 0 14px rgba(242,180,60,.7)',
+            opacity: animate ? 0 : 0.9,
+            pointerEvents: 'none',
+            animation: animate ? `tmx-glyph-pop 520ms ${EASE_GAME} ${420 + i * 110}ms both` : 'none',
+          }}
+        >
+          {g.ch}
+        </span>
+      ))}
+    </>
+  );
+}
+
+function IgniteOverlay({
+  level,
+  phase,
+  reduced,
+}: {
+  level: number;
+  phase: IgnitePhase;
+  reduced: boolean;
+}) {
+  // Il crossfade del copy: testo di fase-1 (ignite/peak) → testo rituale finale (decolor→).
+  const showFinalCopy = phase === 'decolor' || phase === 'reveal' || phase === 'handoff';
+  // Elementi di scena: montati e animati dalla fase reveal in poi; in reduced sono statici.
+  const revealMounted = reduced || phase === 'reveal' || phase === 'handoff';
+  const revealAnimate = revealMounted && !reduced;
+
   return (
     <div
       role="status"
@@ -43,36 +168,98 @@ function IgniteOverlay({ level }: { level: number }) {
         padding: '40px 30px',
         background: 'radial-gradient(120% 80% at 50% 42%, rgba(44,27,18,.92) 0%, rgba(11,6,3,.97) 70%)',
         backdropFilter: 'blur(2px)',
-        animation: 'tmx-ignite-veil .35s ease-out both',
+        // FASE 5 — HANDOFF: l'INTERO overlay svanisce (niente taglio secco verso /guest).
+        opacity: phase === 'handoff' ? 0 : 1,
+        transition: 'opacity .52s ease-in-out',
+        animation: reduced ? 'none' : 'tmx-ignite-veil .35s ease-out both',
       }}
     >
       <style>{IGNITE_KEYFRAMES}</style>
-      {/* Il Totem prende vita: level sale 0→6, glow progressivo + tmx-awake sulle maschere. */}
-      <Totem level={level} size={210} />
-      <div style={{ textAlign: 'center', animation: 'tmx-ignite-rise .5s ease-out both' }}>
-        <h2
+
+      {/* Blocco Totem + elementi di scena. Gli anelli/pioggia/glifi si espandono dal suo centro. */}
+      <div style={{ position: 'relative', width: 210, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        {revealMounted && <RevealRings animate={revealAnimate} />}
+        {/* Il Totem prende vita: level sale 0→6, glow progressivo + tmx-awake sulle maschere. */}
+        <div style={{ position: 'relative', zIndex: 1 }}>
+          <Totem level={level} size={210} />
+        </div>
+        {revealMounted && <RevealRain animate={revealAnimate} />}
+        {revealMounted && <RevealGlyphs animate={revealAnimate} />}
+      </div>
+
+      {/* Copy con crossfade: due blocchi sovrapposti, opacità pilotata dalla fase. */}
+      <div
+        style={{
+          position: 'relative',
+          textAlign: 'center',
+          animation: reduced ? 'none' : 'tmx-ignite-rise .5s ease-out both',
+          minHeight: 92,
+          width: '100%',
+        }}
+      >
+        {/* Copy fase-1: "IL TUO TOTEM PRENDE VITA" */}
+        <div
           style={{
-            fontFamily: 'var(--font-display)',
-            fontSize: 30,
-            lineHeight: 1.0,
-            letterSpacing: '.04em',
-            margin: 0,
-            textTransform: 'uppercase',
-            color: '#fff',
-            textShadow: '0 0 22px rgba(255,168,72,.55)',
+            position: showFinalCopy ? 'absolute' : 'relative',
+            inset: showFinalCopy ? 0 : undefined,
+            opacity: showFinalCopy ? 0 : 1,
+            transition: 'opacity .5s ease-in-out',
           }}
         >
-          IL TUO TOTEM<br />PRENDE VITA
-        </h2>
-        <div style={{ marginTop: 12, color: '#D89A3E', fontSize: 13, letterSpacing: '.2em', textTransform: 'uppercase' }}>
-          La serata è tua
+          <h2
+            style={{
+              fontFamily: 'var(--font-display)',
+              fontSize: 30,
+              lineHeight: 1.0,
+              letterSpacing: '.04em',
+              margin: 0,
+              textTransform: 'uppercase',
+              color: '#fff',
+              textShadow: '0 0 22px rgba(255,168,72,.55)',
+              animation: reduced || phase !== 'peak' ? 'none' : 'tmx-peak-breathe 1.6s ease-in-out infinite',
+            }}
+          >
+            IL TUO TOTEM<br />PRENDE VITA
+          </h2>
+          <div style={{ marginTop: 12, color: '#D89A3E', fontSize: 13, letterSpacing: '.2em', textTransform: 'uppercase' }}>
+            La serata è tua
+          </div>
+        </div>
+
+        {/* Copy rituale finale: "LA TUA SERATA COMINCIA" (crossfade da fase decolor). */}
+        <div
+          style={{
+            position: showFinalCopy ? 'relative' : 'absolute',
+            inset: showFinalCopy ? undefined : 0,
+            opacity: showFinalCopy ? 1 : 0,
+            transition: 'opacity .5s ease-in-out',
+          }}
+        >
+          <h2
+            style={{
+              fontFamily: 'var(--font-display)',
+              fontSize: 30,
+              lineHeight: 1.0,
+              letterSpacing: '.04em',
+              margin: 0,
+              textTransform: 'uppercase',
+              color: '#fff',
+              textShadow: '0 0 22px rgba(255,168,72,.55)',
+              animation: reduced || phase !== 'reveal' ? 'none' : `tmx-final-copy 560ms ${EASE_GAME} 640ms both`,
+            }}
+          >
+            LA TUA SERATA<br />COMINCIA
+          </h2>
+          <div style={{ marginTop: 12, color: '#D89A3E', fontSize: 13, letterSpacing: '.2em', textTransform: 'uppercase' }}>
+            La serata è tua
+          </div>
         </div>
       </div>
     </div>
   );
 }
 
-export default function Onboarding({ nome, onNome, accettato, onAccettato, submitting, errore, canSubmit, onSubmit, igniting = false, igniteLevel = 0 }: Props) {
+export default function Onboarding({ nome, onNome, accettato, onAccettato, submitting, errore, canSubmit, onSubmit, igniting = false, igniteLevel = 0, ignitePhase = 'idle', reducedMotion = false }: Props) {
   return (
     <form
       onSubmit={onSubmit}
@@ -202,7 +389,7 @@ export default function Onboarding({ nome, onNome, accettato, onAccettato, submi
         <div style={{ textAlign: 'center', color: '#A58A66', fontSize: 12, marginTop: 14 }}>Nessuna app da installare</div>
       </div>
 
-      {igniting && <IgniteOverlay level={igniteLevel} />}
+      {igniting && <IgniteOverlay level={igniteLevel} phase={ignitePhase} reduced={reducedMotion} />}
     </form>
   );
 }
