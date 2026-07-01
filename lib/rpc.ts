@@ -61,6 +61,7 @@ export type LedgerRow = {
   importo_euro: number | null; // valorizzato solo sulle 'ricarica'
   operatore: string | null; // auth.uid() di cassa/regia, null se ospite
   guest_id: string;
+  nome: string | null; // nome ospite (LEFT JOIN guests): null se guest assente/cancellata
 };
 
 // Totali del ledger, AGGREGATI dal DB (mai ricalcolati nel client):
@@ -74,6 +75,17 @@ export type LedgerTotali = {
 };
 
 export type Ledger = { totali: LedgerTotali; righe: LedgerRow[] };
+
+// Anteprima conversione credito → ticket dell'ospite chiamante (sola lettura, guest-safe).
+//   saldo_normale / saldo_premium — credito residuo (int, dal DB su public.guests)
+//   ticket_preview — ticket che si otterrebbero convertendo ORA, calcolato con i tassi
+//     dell'evento (ticket_conversione_normale/premium): stessa formula di convert_credit,
+//     ma senza mutare nulla. Il client NON ricalcola: legge il numero dal server.
+export type ConvertPreview = {
+  saldo_normale: number;
+  saldo_premium: number;
+  ticket_preview: number;
+};
 
 // Errore applicativo uniforme: nasconde la differenza PostgREST/Supabase/route /api
 // e porta un messaggio leggibile + il codice per i casi gestibili a UI.
@@ -327,6 +339,61 @@ export async function convertCredit(
   return data;
 }
 
+// getConvertPreview(...) -> anteprima della conversione credito → ticket dell'OSPITE
+// chiamante (fase LAST_CALL, UX): "quanti ticket otterrei convertendo il mio credito ORA?".
+// Sola LETTURA/aggregazione server-side: NON scrive nulla (convert_credit resta l'unica
+// scrittura) e il client NON ricalcola — legge saldi e ticket_preview dal server. Gate:
+// requireAuth (ospite). ticket_preview usa gli STESSI tassi di convert_credit
+// (events.ticket_conversione_normale/premium).
+//
+// Branch USE_API:
+//   - API: GET /api/guest/convert-preview?event=<id> → { saldo_normale, saldo_premium,
+//     ticket_preview }. La route risolve l'ospite dal chiamante (auth.uid()) e aggrega in SQL.
+//   - supabase: DUE select dirette sotto la RLS dell'ospite — (1) la propria riga guests
+//     (guests_select: auth_uid = auth.uid()), (2) i tassi dell'evento (events_select). Il
+//     prodotto è aggregazione di numeri AUTORITATIVI dal DB (saldi + tassi), non un ricalcolo
+//     di saldi/ticket lato client (quelli restano su public.guests). auth.uid() non è
+//     disponibile qui, quindi filtriamo la guest per event_id e ci affidiamo alla RLS che
+//     espone SOLO la riga del chiamante (maybeSingle → una sola riga).
+export async function getConvertPreview(
+  supabase: SupabaseClient,
+  args: { eventId: string },
+): Promise<ConvertPreview> {
+  if (USE_API) {
+    return apiGet<ConvertPreview>(
+      `/api/guest/convert-preview?event=${encodeURIComponent(args.eventId)}`,
+    );
+  }
+
+  const { data: gData, error: gErr } = await supabase
+    .from('guests')
+    .select('saldo_normale, saldo_premium')
+    .eq('event_id', args.eventId)
+    .maybeSingle();
+  if (gErr) rethrow(gErr);
+  const g = gData as { saldo_normale: number; saldo_premium: number } | null;
+  if (!g) throw new RpcError('Ospite non registrato per questo evento');
+
+  const { data: eData, error: eErr } = await supabase
+    .from('events')
+    .select('ticket_conversione_normale, ticket_conversione_premium')
+    .eq('id', args.eventId)
+    .maybeSingle();
+  if (eErr) rethrow(eErr);
+  const e = eData as {
+    ticket_conversione_normale: number;
+    ticket_conversione_premium: number;
+  } | null;
+  if (!e) throw new RpcError('Evento inesistente');
+
+  const saldo_normale = Number(g.saldo_normale) || 0;
+  const saldo_premium = Number(g.saldo_premium) || 0;
+  const ticket_preview =
+    saldo_normale * (Number(e.ticket_conversione_normale) || 0) +
+    saldo_premium * (Number(e.ticket_conversione_premium) || 0);
+  return { saldo_normale, saldo_premium, ticket_preview };
+}
+
 // lookupGuestByPin -> riga guests dell'ospite col PIN dato, o null se non esiste.
 // SELECT DIRETTA (non RPC): consentita allo staff dalla policy RLS guests_select (is_staff).
 // Lookup MIRATO (un solo PIN per volta, filtrato su event_id+pin): non espone l'elenco PIN.
@@ -500,12 +567,25 @@ export async function getLedger(
   const { data: righeData, error: righeErr } = await supabase
     .from('transactions')
     .select(
-      'id, created_at, tipo, tipo_consumazione, qta_delta, ticket_delta, importo_euro, operatore, guest_id',
+      // embed guests(nome): PostgREST risolve la FK guest_id→guests e annida { nome }.
+      // La RLS staff (tx_select/guests_select) copre entrambe le tabelle per la regia.
+      'id, created_at, tipo, tipo_consumazione, qta_delta, ticket_delta, importo_euro, operatore, guest_id, guests(nome)',
     )
     .eq('event_id', args.eventId)
     .order('created_at', { ascending: false })
     .limit(100);
   if (righeErr) rethrow(righeErr);
+
+  // PostgREST annida l'embed come `guests`. Il generatore di tipi lo infersce come array
+  // (relazione), quindi accettiamo sia oggetto che array e prendiamo il primo `nome`.
+  // Appiattiamo su `nome` per allineare la shape LedgerRow al path /api (che fa il JOIN).
+  type GuestEmbed = { nome: string } | { nome: string }[] | null;
+  type RigaEmbed = Omit<LedgerRow, 'nome'> & { guests: GuestEmbed };
+  const nomeOf = (g: GuestEmbed): string | null =>
+    Array.isArray(g) ? (g[0]?.nome ?? null) : (g?.nome ?? null);
+  const righe: LedgerRow[] = ((righeData as unknown as RigaEmbed[] | null) ?? []).map(
+    ({ guests, ...r }) => ({ ...r, nome: nomeOf(guests) }),
+  );
 
   // Set COMPLETO (niente limit) delle sole colonne numeriche → i totali coprono tutto
   // l'evento. La somma qui è aggregazione di un set completo dal DB, non un ricalcolo di
@@ -534,7 +614,7 @@ export async function getLedger(
     { incasso_euro: 0, gettoni_emessi: 0, ticket_emessi: 0 },
   );
 
-  return { totali, righe: (righeData as LedgerRow[] | null) ?? [] };
+  return { totali, righe };
 }
 
 // Esito estrazione dell'OSPITE chiamante (reveal G10). Sola lettura, guest-safe:

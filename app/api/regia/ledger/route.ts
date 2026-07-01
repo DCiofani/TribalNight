@@ -56,12 +56,17 @@ export async function GET(req: Request): Promise<NextResponse> {
       );
 
       // Ultime RIGHE_LIMIT righe (created_at desc), sotto la stessa RLS staff.
+      // LEFT JOIN guests → aggiunge il NOME dell'ospite alla riga (null se la guest
+      // fosse assente/cancellata: LEFT preserva comunque la transaction). Non altera i
+      // totali (calcolati sopra su transactions da soli); prefissiamo le colonne con t.*
+      // per disambiguare l'id ora che c'è la join.
       const righeRes = await c.query(
-        `select id, created_at, tipo, tipo_consumazione, qta_delta, ticket_delta,
-                importo_euro, operatore, guest_id
-         from public.transactions
-         where event_id = $1
-         order by created_at desc
+        `select t.id, t.created_at, t.tipo, t.tipo_consumazione, t.qta_delta, t.ticket_delta,
+                t.importo_euro, t.operatore, t.guest_id, g.nome
+         from public.transactions t
+         left join public.guests g on g.id = t.guest_id
+         where t.event_id = $1
+         order by t.created_at desc
          limit $2`,
         [event, RIGHE_LIMIT],
       );

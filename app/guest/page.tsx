@@ -19,6 +19,7 @@ import {
   getActiveSession,
   registerTaps,
   convertCredit,
+  getConvertPreview,
   getMyDrawResult,
   RpcError,
   type DrinkRow,
@@ -323,6 +324,10 @@ export default function GuestPage() {
   // "Non ora": l'ospite può posticipare e navigare l'hub; resta in LAST_CALL finché la
   // fase non cambia. Non è una decisione autoritativa, solo una preferenza UX locale.
   const [convertDismissed, setConvertDismissed] = useState(false);
+  // Anteprima "= +N ticket" della conversione: SEMPRE dal server (getConvertPreview →
+  // ticket_preview, stessi tassi di convert_credit). Il client NON la calcola; null =
+  // non ancora nota (nessun evento/anteprima disponibile) → la CTA la nasconde.
+  const [convertPreview, setConvertPreview] = useState<number | null>(null);
 
   // ── Estrazione (G10) ───────────────────────────────────────────────────────
   // Esito del sorteggio, autoritativo dal server (my_draw_result). null = non ancora noto
@@ -516,6 +521,39 @@ export default function GuestPage() {
     }
   }, [guestId, convertBusy]);
 
+  // ── Conversione (G9): anteprima "= +N ticket" dal server ───────────────────
+  // In fase LAST_CALL con credito residuo (>0) chiediamo a getConvertPreview il
+  // ticket_preview (aggregato server-side con gli STESSI tassi di convert_credit): il
+  // client NON lo calcola. Rifetch su cambio saldi (delta consumazioni post-registrazione)
+  // e su cambio evento/fase. Fuori da LAST_CALL o senza credito azzeriamo l'anteprima.
+  const saldoNormaleNum = saldoNormale ?? 0;
+  const saldoPremiumNum = saldoPremium ?? 0;
+  useEffect(() => {
+    if (!eventId || fase !== 'LAST_CALL') {
+      setConvertPreview(null);
+      return;
+    }
+    if (saldoNormaleNum + saldoPremiumNum <= 0) {
+      setConvertPreview(null);
+      return;
+    }
+    let active = true;
+    (async () => {
+      try {
+        const p = await getConvertPreview(supabaseRef.current!, { eventId });
+        if (!active) return;
+        setConvertPreview(p.ticket_preview);
+      } catch {
+        // Errore transitorio: l'anteprima resta nascosta (null); la conversione resta
+        // possibile e i saldi/ticket restano server-authoritative via useGuestState.
+        if (active) setConvertPreview(null);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [eventId, fase, saldoNormaleNum, saldoPremiumNum]);
+
   // ── Estrazione (G10): poll dell'esito guest-safe finché estratto===true ────
   // Attivo in fase ESTRAZIONE e CHIUSA (se l'estrazione è già avvenuta l'esito è finale).
   // my_draw_result NON espone dati di altri ospiti: ritorna SOLO l'esito del chiamante.
@@ -617,7 +655,7 @@ export default function GuestPage() {
       <Conversione
         saldoNormale={saldoNormale ?? 0}
         saldoPremium={saldoPremium ?? 0}
-        anteprimaTicket={null}
+        anteprimaTicket={convertPreview}
         busy={convertBusy}
         error={convertError}
         done={converted}

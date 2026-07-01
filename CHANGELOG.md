@@ -6,6 +6,13 @@ Tutte le modifiche rilevanti a **Totem Night**. Formato: [Keep a Changelog](http
 
 ## [Unreleased]
 
+### Polish ✅
+- **Workflow multi-agente** (enabler ∥ → UI ∥ → review ok).
+- **Anteprima conversione (G9)**: `GET /api/guest/convert-preview` + `getConvertPreview` — calcola SERVER-side i ticket risultanti (saldi × tassi `ticket_conversione_normale/premium` dell'evento); Conversione mostra "= +N ticket" (mai calcolato nel client; `convert_credit` resta l'unica scrittura).
+- **Nomi ospite nel ledger (R7)**: ledger route con LEFT JOIN guests → colonna Ospite col nome (totali invariati). **Filtri ledger** client-side (tipo + ricerca) sulle righe già ricevute.
+- **Storico estrazioni (R6)**: `GET /api/regia/draws` + `getDrawHistory` (lista compatta) + tabella in regia.
+- ✅ tsc pulito; `next build` (api) verde. **Catalogo premi reali = differito** (serve la lista premi; il reveal mostra "N° posto").
+
 ### Regia R7 ledger + R8 ospiti ✅
 - **Workflow multi-agente** (enabler ∥ → UI → review ok). Nessuna migration: read staff sotto RLS esistente.
 - **R7 Ledger** (`GET /api/regia/ledger` + `getLedger`): totali **aggregati in SQL server** (incasso €, gettoni/ticket emessi) + tabella append-only (ultime ~100 tx) + export CSV client-side (dump dei dati ricevuti). 

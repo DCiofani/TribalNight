@@ -152,6 +152,51 @@ export async function getLastDraw(
   return (data as LastDraw | null) ?? null;
 }
 
+// Una riga dello storico estrazioni (pannello E2): metadati dell'estrazione + numero
+// vincitori richiesti (n_winners), SENZA l'intero array winners — la lista è volutamente
+// compatta, il dettaglio dei vincitori si legge con getLastDraw. seed può essere null.
+export type DrawHistoryEntry = {
+  id: string;
+  seed: number | null;
+  n_winners: number;
+  created_at: string;
+};
+
+// getDrawHistory(...) -> storico delle estrazioni dell'evento: [{ id, seed, n_winners,
+// created_at }] dalla più recente (created_at desc, limit 50). Sola lettura, NIENTE
+// ricalcolo: sono le righe append-only prodotte da run_draw, si mostra solo meta+conteggio
+// (NON l'intero winners, per una lista leggera). Alimenta lo storico estrazioni (E2).
+//
+// NB: la route /api espone anche jsonb_array_length(winners) come `n` (vincitori effettivi
+// estratti); qui la firma pubblica resta stabile su { id, seed, n_winners, created_at },
+// coerente col branch supabase che legge la sola tabella draws. draws (plurale) = storico;
+// draw (singolare) = ULTIMA estrazione (getLastDraw).
+//
+// Branch USE_API:
+//   - API: GET /api/regia/draws?event=<id> → DrawHistoryEntry[] (gate regia/admin
+//     server-side; order+limit nella query SQL).
+//   - supabase (INVARIATO come stile getGuestsList/getLeaderboard): select su draws filtrata
+//     event_id, order created_at desc, limit 50. RLS draws_select richiede is_staff().
+export async function getDrawHistory(
+  supabase: SupabaseClient,
+  args: { eventId: string },
+): Promise<DrawHistoryEntry[]> {
+  if (USE_API) {
+    return apiGet<DrawHistoryEntry[]>(
+      `/api/regia/draws?event=${encodeURIComponent(args.eventId)}`,
+    );
+  }
+
+  const { data, error } = await supabase
+    .from('draws')
+    .select('id, seed, n_winners, created_at')
+    .eq('event_id', args.eventId)
+    .order('created_at', { ascending: false })
+    .limit(50);
+  if (error) rethrow(error);
+  return (data as DrawHistoryEntry[] | null) ?? [];
+}
+
 // updateEventSettings(...) -> aggiorna i parametri economici/di gioco dell'evento.
 // Tutti e 9 i campi sono OPZIONALI: quelli omessi (→ null) significano "non toccare",
 // il DB fa coalesce sul valore esistente. Mappa camelCase → snake_case, ogni campo `?? null`.

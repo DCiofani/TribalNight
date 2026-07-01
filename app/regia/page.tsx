@@ -59,10 +59,12 @@ import {
   setDrinkActive,
   getLeaderboard,
   getLastDraw,
+  getDrawHistory,
   getGuestsList,
   type Phase,
   type LeaderboardRow,
   type LastDraw,
+  type DrawHistoryEntry,
   type GuestListRow,
 } from '@/lib/regia';
 
@@ -360,6 +362,12 @@ export default function RegiaPage() {
   const [lastDraw, setLastDraw] = useState<LastDraw | null>(null);
   const [lastDrawChecked, setLastDrawChecked] = useState(false);
   const [lastDrawError, setLastDrawError] = useState<string | null>(null);
+  // drawHistory: storico estrazioni (getDrawHistory) → tabella (ora, n. vincitori, seed).
+  //   SOLA LETTURA: le righe append-only arrivano già ordinate/limitate dal server, il
+  //   client non ricalcola nulla. drawHistoryChecked distingue "non ancora letto" da "vuoto".
+  const [drawHistory, setDrawHistory] = useState<DrawHistoryEntry[]>([]);
+  const [drawHistoryChecked, setDrawHistoryChecked] = useState(false);
+  const [drawHistoryError, setDrawHistoryError] = useState<string | null>(null);
 
   // ── Sessioni tap (R3) — stato LIVE/IDLE, tutto SOLA LETTURA dal server ───
   // activeSession: finestra della sessione attiva (getActiveSession) o null (IDLE).
@@ -404,6 +412,11 @@ export default function RegiaPage() {
   const [ledgerError, setLedgerError] = useState<string | null>(null);
   const [ledgerChecked, setLedgerChecked] = useState(false);
   const [ledgerBusy, setLedgerBusy] = useState(false);
+  // Filtri PRESENTAZIONALI del ledger (R7): agiscono SOLO sull'array righe già ricevuto dal
+  // server, non rifetchano e non ricalcolano i totali (che restano quelli aggregati dal DB).
+  //   ledgerTipoFilter = 'all' | tipo transazione; ledgerSearch = testo su ospite/operatore.
+  const [ledgerTipoFilter, setLedgerTipoFilter] = useState<'all' | LedgerRow['tipo']>('all');
+  const [ledgerSearch, setLedgerSearch] = useState('');
 
   // ── R8 — Ospiti (lista + drawer, SOLA LETTURA) ──────────────────────────
   // guests = lista ospiti dal server (saldi/ticket/livello autoritativi dal DB). guestSearch
@@ -445,6 +458,29 @@ export default function RegiaPage() {
     if (!selectedGuest || !ledger) return [];
     return ledger.righe.filter((r) => r.guest_id === selectedGuest.id);
   }, [selectedGuest, ledger]);
+
+  // Nome ospite per una riga del ledger (R7): PRIMA il campo `nome` server-authoritative
+  // (LEFT JOIN guests nella route/embed), POI la mappa dalla lista ospiti (se il tab Ospiti
+  // è stato visitato), infine null se nessuno dei due è disponibile. NON è un ricalcolo:
+  // sono solo fallback di presentazione sulla stessa identità già prodotta dal server.
+  const ledgerGuestName = (r: LedgerRow): string | null =>
+    r.nome ?? guestNameById.get(r.guest_id) ?? null;
+
+  // Righe ledger FILTRATE (R7): filtro presentazionale client-side sull'array GIÀ ricevuto
+  // (per tipo + ricerca testo su ospite/operatore). NON rifetcha e NON ricalcola i totali:
+  // i totali mostrati restano quelli aggregati dal server (ledger.totali), indipendenti da qui.
+  const filteredLedgerRows = useMemo(() => {
+    if (!ledger) return [];
+    const q = ledgerSearch.trim().toLowerCase();
+    return ledger.righe.filter((r) => {
+      if (ledgerTipoFilter !== 'all' && r.tipo !== ledgerTipoFilter) return false;
+      if (!q) return true;
+      const nome = (r.nome ?? guestNameById.get(r.guest_id) ?? '').toLowerCase();
+      const operatore = (r.operatore ?? '').toLowerCase();
+      const guestId = r.guest_id.toLowerCase();
+      return nome.includes(q) || operatore.includes(q) || guestId.includes(q);
+    });
+  }, [ledger, ledgerTipoFilter, ledgerSearch, guestNameById]);
 
   // Ref alla funzione di fetch stats per usarla dentro lo stream/polling senza
   // ricreare l'effetto ad ogni render (eventId è la sola dipendenza che conta).
@@ -532,6 +568,23 @@ export default function RegiaPage() {
       setLastDrawError(err instanceof Error ? err.message : 'Estrazione non disponibile');
     } finally {
       setLastDrawChecked(true);
+    }
+  }
+
+  // Fetch SOLA LETTURA dello storico estrazioni (R6): [{ id, seed, n_winners, created_at }]
+  // ordinato dal più recente (limit lato server). NIENTE ricalcolo: sono le righe append-only
+  // prodotte da run_draw, il client si limita a mostrarle. Alimenta la tabella STORICO.
+  async function refetchDrawHistory() {
+    const id = eventIdRef.current;
+    if (!id) return;
+    try {
+      const rows = await getDrawHistory(supabase, { eventId: id });
+      setDrawHistory(rows);
+      setDrawHistoryError(null);
+    } catch (err) {
+      setDrawHistoryError(err instanceof Error ? err.message : 'Storico estrazioni non disponibile');
+    } finally {
+      setDrawHistoryChecked(true);
     }
   }
 
@@ -743,6 +796,8 @@ export default function RegiaPage() {
     void (async () => {
       if (!active) return;
       await refetchLastDraw();
+      if (!active) return;
+      await refetchDrawHistory();
     })();
     return () => {
       active = false;
@@ -827,6 +882,9 @@ export default function RegiaPage() {
     setLastDraw(null);
     setLastDrawChecked(false);
     setLastDrawError(null);
+    setDrawHistory([]);
+    setDrawHistoryChecked(false);
+    setDrawHistoryError(null);
     setActiveSession(null);
     setSessionChecked(false);
     setSessionError(null);
@@ -839,6 +897,8 @@ export default function RegiaPage() {
     setLedger(null);
     setLedgerError(null);
     setLedgerChecked(false);
+    setLedgerTipoFilter('all');
+    setLedgerSearch('');
     setGuests([]);
     setGuestsError(null);
     setGuestsChecked(false);
@@ -927,6 +987,8 @@ export default function RegiaPage() {
         // Reveal stage (R6b): i vincitori arrivano dal server via getLastDraw, MAI dal client.
         // Rileggiamo subito l'estrazione appena registrata senza attendere un refetch di tab.
         await refetchLastDraw();
+        // Storico (R6): la nuova estrazione appena registrata compare in cima alla tabella.
+        await refetchDrawHistory();
         return res;
       },
       'Estrazione eseguita',
@@ -1866,6 +1928,76 @@ export default function RegiaPage() {
                 </div>
               </div>
             )}
+
+            {/* ── STORICO ESTRAZIONI — righe append-only dal server (getDrawHistory). ──
+                SOLA LETTURA: la lista arriva già ordinata (recente→vecchia) e limitata dal
+                server; qui non si somma né riordina nulla. Stato vuoto/errore coerente. */}
+            <div style={{ ...panel, maxWidth: 620, margin: '0 auto', width: '100%' }}>
+              <div style={{ fontFamily: 'var(--font-ritual)', letterSpacing: '.16em', fontSize: 11, color: C.inkMuted, marginBottom: 14 }}>
+                STORICO ESTRAZIONI
+              </div>
+
+              {drawHistoryError && <Note kind="err">Storico non disponibile: {drawHistoryError}</Note>}
+
+              {/* Prima lettura in corso. */}
+              {eventId && !drawHistoryChecked && !drawHistoryError && (
+                <p style={{ margin: 0, color: C.inkMuted, fontSize: 14 }}>Carico lo storico…</p>
+              )}
+
+              {/* Vuoto coerente: nessuna estrazione ancora registrata. */}
+              {drawHistoryChecked && !drawHistoryError && drawHistory.length === 0 && (
+                <p style={{ margin: 0, color: C.inkMuted, fontSize: 14 }}>
+                  Nessuna estrazione registrata per questo evento.
+                </p>
+              )}
+
+              {drawHistory.length > 0 && (
+                <>
+                  {/* Header tabella. */}
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: '1.6fr 110px 1fr',
+                      gap: 12,
+                      padding: '0 12px 10px',
+                      fontFamily: 'var(--font-ritual)',
+                      letterSpacing: '.08em',
+                      fontSize: 11,
+                      color: C.inkMuted,
+                    }}
+                  >
+                    <div>ORA</div>
+                    <div style={{ textAlign: 'right' }}>N. VINCITORI</div>
+                    <div style={{ textAlign: 'right' }}>SEED</div>
+                  </div>
+                  {drawHistory.map((d) => (
+                    <div
+                      key={d.id}
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: '1.6fr 110px 1fr',
+                        gap: 12,
+                        alignItems: 'center',
+                        padding: '11px 12px',
+                        borderBottom: `1px solid ${C.border}`,
+                        fontSize: 13.5,
+                        fontVariantNumeric: 'tabular-nums',
+                      }}
+                    >
+                      <div style={{ color: C.inkSoft }}>
+                        {new Date(d.created_at).toLocaleString('it-IT')}
+                      </div>
+                      <div style={{ textAlign: 'right', color: C.gold, fontWeight: 600 }}>
+                        {d.n_winners}
+                      </div>
+                      <div style={{ textAlign: 'right', color: C.inkMuted, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {d.seed ?? '—'}
+                      </div>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
           </>
         )}
 
@@ -1893,6 +2025,46 @@ export default function RegiaPage() {
                   Esporta CSV
                 </DButton>
               </div>
+            </div>
+
+            {/* Filtri PRESENTAZIONALI (R7): tipo + ricerca su ospite/operatore. Agiscono SOLO
+                sull'array righe già ricevuto — NON rifetchano e NON toccano i totali server. */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+              <div role="group" aria-label="Filtra per tipo" style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                {(['all', 'ricarica', 'consumo', 'tap', 'conversione'] as const).map((t) => {
+                  const active = ledgerTipoFilter === t;
+                  return (
+                    <button
+                      key={t}
+                      type="button"
+                      aria-pressed={active}
+                      onClick={() => setLedgerTipoFilter(t)}
+                      style={{
+                        padding: '7px 14px',
+                        borderRadius: 999,
+                        fontSize: 13,
+                        fontWeight: active ? 700 : 500,
+                        fontFamily: 'var(--font-ui)',
+                        cursor: 'pointer',
+                        textTransform: 'capitalize',
+                        border: `1px solid ${active ? C.blue : C.border}`,
+                        background: active ? 'rgba(58,91,190,.18)' : 'transparent',
+                        color: active ? '#fff' : C.inkMuted,
+                      }}
+                    >
+                      {t === 'all' ? 'Tutti' : t}
+                    </button>
+                  );
+                })}
+              </div>
+              <input
+                type="search"
+                aria-label="Cerca movimento per ospite o operatore"
+                placeholder="Cerca ospite o operatore…"
+                value={ledgerSearch}
+                onChange={(e) => setLedgerSearch(e.target.value)}
+                style={{ ...inputStyle, width: 260, marginLeft: 'auto' }}
+              />
             </div>
 
             {/* Striscia TOTALI — AGGREGATI dal server (mai ricalcolati nel client). */}
@@ -1961,11 +2133,18 @@ export default function RegiaPage() {
                   Nessun movimento registrato per questo evento.
                 </p>
               )}
+              {/* Vuoto da FILTRO: righe presenti, ma nessuna soddisfa tipo/ricerca. */}
+              {ledger && ledger.righe.length > 0 && filteredLedgerRows.length === 0 && (
+                <p style={{ margin: '6px 0 0', color: C.inkMuted, fontSize: 14 }}>
+                  Nessun movimento corrisponde ai filtri correnti.
+                </p>
+              )}
 
               {ledger &&
-                ledger.righe.map((r) => {
+                filteredLedgerRows.map((r) => {
                   const chip = LEDGER_TIPO_CHIP[r.tipo];
                   const gColor = r.qta_delta > 0 ? C.green : r.qta_delta < 0 ? EMBER : C.inkMuted;
+                  const nome = ledgerGuestName(r);
                   return (
                     <div
                       key={r.id}
@@ -2001,7 +2180,7 @@ export default function RegiaPage() {
                         </span>
                       </div>
                       <div style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                        {guestNameById.get(r.guest_id) ?? (
+                        {nome ?? (
                           <span style={{ color: C.inkMuted, fontFamily: 'var(--font-ui)' }}>
                             {r.guest_id.slice(0, 8)}…
                           </span>
@@ -2025,7 +2204,7 @@ export default function RegiaPage() {
 
               {ledger && ledger.righe.length >= 100 && (
                 <p style={{ margin: '12px 0 0', color: C.inkMuted, fontSize: 12.5 }}>
-                  Mostrate le ultime 100 righe (più recenti). I totali coprono l&apos;intero evento.
+                  Mostrate le ultime 100 righe (più recenti){ledgerTipoFilter !== 'all' || ledgerSearch.trim() ? ', filtrate qui lato client' : ''}. I totali coprono l&apos;intero evento.
                 </p>
               )}
             </div>
