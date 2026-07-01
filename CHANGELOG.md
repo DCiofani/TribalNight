@@ -6,6 +6,12 @@ Tutte le modifiche rilevanti a **Totem Night**. Formato: [Keep a Changelog](http
 
 ## [Unreleased]
 
+### Regia R7 ledger + R8 ospiti ✅
+- **Workflow multi-agente** (enabler ∥ → UI → review ok). Nessuna migration: read staff sotto RLS esistente.
+- **R7 Ledger** (`GET /api/regia/ledger` + `getLedger`): totali **aggregati in SQL server** (incasso €, gettoni/ticket emessi) + tabella append-only (ultime ~100 tx) + export CSV client-side (dump dei dati ricevuti). 
+- **R8 Ospiti** (`GET /api/regia/guests` + `getGuestsList`): tabella nome/PIN/saldi/ticket/livello (ticket_totali GENERATED, mai ricalcolato) + ricerca client presentazionale + drawer dettaglio con mini-Totem + timeline tx (da getLedger filtrato). Sola lettura.
+- ✅ tsc pulito; `next build` (api) verde (`/api/regia/ledger`, `/api/regia/guests`, /regia 13.3kB). Gap noti: nomi ospite/operatore nel ledger troncati a id (no endpoint risoluzione nomi), filtri avanzati ledger rimandabili.
+
 ### M4 — finale: conversione G9 + estrazione/reveal G10 + regia R6 ✅ (flussi gioco G7-G10 COMPLETI)
 - **Workflow multi-agente** (enabler ∥ → UI ∥ → review, file-disgiunti). Review verdict **ok**.
 - **Gap risolto — reveal guest-safe**: `draws` è staff-only (RLS 0002) → nuova RPC **`my_draw_result(p_event)`** (`0008`, SECURITY DEFINER, grant authenticated) che ritorna SOLO l'esito del chiamante `{estratto, vinto, premio}` (scansiona `draws.winners` jsonb `{pos,guest_id,nome,tickets}` cercando il proprio `guest_id`; mai dati di altri) + `GET /api/guest/draw-result` + `getMyDrawResult` (lib/rpc.ts). `GET /api/regia/draw` (staff, ultima draw) + `getLastDraw`/`LastDraw`/`DrawWinner` (lib/regia.ts).

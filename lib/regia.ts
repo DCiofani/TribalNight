@@ -22,6 +22,20 @@ export type Phase = 'SETUP' | 'APERTA' | 'LAST_CALL' | 'ESTRAZIONE' | 'CHIUSA';
 // somma nulla, mostra solo la classifica ordinata.
 export type LeaderboardRow = { guest_id: string; nome: string; tap_count: number };
 
+// Una riga della lista ospiti R8: identità (nome/pin), saldi e ticket. Tutti i numeri sono
+// autoritativi lato DB — saldo_normale/saldo_premium sono contatori aggiornati dalle RPC di
+// cassa, ticket_totali è una colonna GENERATED (consumo+tap+conversione), livello_totem è
+// derivato server-side. Il client NON ricalcola nulla, mostra solo questi valori.
+export type GuestListRow = {
+  id: string;
+  nome: string;
+  pin: string;
+  saldo_normale: number;
+  saldo_premium: number;
+  ticket_totali: number;
+  livello_totem: number;
+};
+
 // rethrow locale: lib/rpc.ts tiene il suo rethrow module-private, quindi ne ridefiniamo
 // qui una copia identica (3 righe). Nasconde la differenza PostgREST/Supabase/route /api
 // e porta un messaggio leggibile + il codice per i casi gestibili a UI.
@@ -400,4 +414,37 @@ export async function getLeaderboard(
     const g = Array.isArray(r.guests) ? r.guests[0] : r.guests;
     return { guest_id: r.guest_id, nome: g?.nome ?? '', tap_count: r.tap_count };
   });
+}
+
+// getGuestsList(...) -> lista ospiti dell'evento per il pannello R8: [{ id, nome, pin,
+// saldo_normale, saldo_premium, ticket_totali, livello_totem }] ordinata per nome (limit 200).
+// Sola lettura, NIENTE ricalcolo: saldi/ticket/livello sono autoritativi lato DB (ticket_totali
+// è colonna GENERATED). Lo staff legge tutti gli ospiti grazie alla policy guests_select
+// (is_staff()). La timeline tx del drawer NON passa da qui: si riusa getLedger filtrato per guest.
+//
+// Branch USE_API:
+//   - API: GET /api/regia/guests?event=<id> → GuestListRow[] (gate ruolo regia/admin
+//     server-side; filtro+order+limit nella query SQL).
+//   - supabase (INVARIATO come stile getLeaderboard/listDrinks): select su guests filtrata
+//     event_id, order nome asc, limit 200. RLS guests_select richiede is_staff().
+export async function getGuestsList(
+  supabase: SupabaseClient,
+  args: { eventId: string },
+): Promise<GuestListRow[]> {
+  if (USE_API) {
+    return apiGet<GuestListRow[]>(
+      `/api/regia/guests?event=${encodeURIComponent(args.eventId)}`,
+    );
+  }
+
+  const { data, error } = await supabase
+    .from('guests')
+    .select(
+      'id, nome, pin, saldo_normale, saldo_premium, ticket_totali, livello_totem',
+    )
+    .eq('event_id', args.eventId)
+    .order('nome', { ascending: true })
+    .limit(200);
+  if (error) rethrow(error);
+  return (data as GuestListRow[] | null) ?? [];
 }

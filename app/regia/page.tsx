@@ -25,6 +25,7 @@ import {
   type RegiaTab,
   type Kpi,
 } from '@/components/screens/Regia';
+import Totem from '@/components/Totem';
 import { createClient } from '@/lib/supabase/client';
 import { getCurrentEventId } from '@/lib/events';
 import { USE_API } from '@/lib/backend-mode';
@@ -38,10 +39,13 @@ import {
   getEventStats,
   listAllDrinks,
   getActiveSession,
+  getLedger,
   RpcError,
   type EventStats,
   type DrinkRow,
   type TipoConsumazione,
+  type Ledger,
+  type LedgerRow,
 } from '@/lib/rpc';
 import {
   setPhase,
@@ -55,9 +59,11 @@ import {
   setDrinkActive,
   getLeaderboard,
   getLastDraw,
+  getGuestsList,
   type Phase,
   type LeaderboardRow,
   type LastDraw,
+  type GuestListRow,
 } from '@/lib/regia';
 
 // Fasi del flusso serata (spec §10). Ordine/labels per timeline e controlli; la fase
@@ -189,18 +195,6 @@ function Note({ kind, children }: { kind: 'ok' | 'err'; children: React.ReactNod
   );
 }
 
-// Placeholder shell coerente per le sezioni non ancora disponibili (R7/R8 e simili).
-function ComingSoon({ label }: { label: string }) {
-  return (
-    <div style={{ ...panel, color: C.inkMuted, fontSize: 14 }}>
-      <div style={{ fontFamily: 'var(--font-ritual)', letterSpacing: '.16em', fontSize: 11, color: C.gold, marginBottom: 8 }}>
-        IN ARRIVO
-      </div>
-      {label}
-    </div>
-  );
-}
-
 // Colore posizione classifica (R3): oro → argento → bronzo per il podio, poi tenue.
 // Solo presentazionale, il ranking arriva già ordinato dal server (tap_count desc).
 const EMBER = '#EE6321'; // ambra del mockup (barra viola→ambra, countdown)
@@ -209,6 +203,82 @@ function rankColor(pos: number): string {
   if (pos === 2) return C.goldSoft;
   if (pos === 3) return EMBER;
   return C.inkMuted;
+}
+
+// Chip del tipo transazione nel ledger (R7): solo presentazionale (border+color per tipo).
+// Il tipo è già validato lato DB (check ('ricarica','consumo','conversione','tap')).
+const LEDGER_TIPO_CHIP: Record<LedgerRow['tipo'], { color: string; border: string }> = {
+  ricarica: { color: C.green, border: 'rgba(43,163,90,.5)' },
+  consumo: { color: EMBER, border: 'rgba(238,99,33,.5)' },
+  conversione: { color: C.blue, border: 'rgba(58,91,190,.6)' },
+  tap: { color: C.gold, border: 'rgba(216,154,62,.5)' },
+};
+
+// Formattazione EURO/interi con cifre "contabili" (it-IT). Solo presentazione: i VALORI
+// arrivano già dal server, qui non si somma né si arrotonda nulla di dominio.
+function fmtEuro(n: number): string {
+  return new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(n);
+}
+function fmtInt(n: number): string {
+  return new Intl.NumberFormat('it-IT').format(n);
+}
+
+// Δ con segno esplicito (i delta positivi mostrano il +) — presentazionale.
+function fmtDelta(n: number): string {
+  if (n === 0) return '0';
+  const s = fmtInt(Math.abs(n));
+  return n > 0 ? `+${s}` : `−${s}`;
+}
+
+// Escape di un campo per CSV (RFC4180-ish): virgolette raddoppiate + quoting se serve.
+function csvCell(v: string | number | null): string {
+  const s = v === null || v === undefined ? '' : String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+// Export CSV client-side delle righe GIÀ ricevute dal server (NON è ricalcolo di dominio:
+// è la serializzazione dei dati del ledger che il DB ha già prodotto). Trigger download via
+// blob + anchor temporaneo, poi revoke dell'URL. Nessuna dipendenza esterna.
+function exportLedgerCsv(righe: LedgerRow[], nameByGuest: Map<string, string>): void {
+  const header = [
+    'Ora',
+    'Tipo',
+    'Tipo consumazione',
+    'Ospite',
+    'Guest ID',
+    'Operatore',
+    'Δ gettoni',
+    'Δ ticket',
+    'Importo €',
+  ];
+  const lines = [header.map(csvCell).join(',')];
+  for (const r of righe) {
+    lines.push(
+      [
+        new Date(r.created_at).toISOString(),
+        r.tipo,
+        r.tipo_consumazione ?? '',
+        nameByGuest.get(r.guest_id) ?? '',
+        r.guest_id,
+        r.operatore ?? '',
+        r.qta_delta,
+        r.ticket_delta,
+        r.importo_euro ?? '',
+      ]
+        .map(csvCell)
+        .join(','),
+    );
+  }
+  // BOM per Excel + CRLF (compatibilità fogli di calcolo).
+  const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `ledger-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 // Anello countdown (R3): Anton al centro, arco ambra che si svuota man mano che i secondi
@@ -327,7 +397,54 @@ export default function RegiaPage() {
   const [formCategoria, setFormCategoria] = useState('');
   const [formOrdine, setFormOrdine] = useState('0');
 
+  // ── R7 — Ledger / riconciliazione (SOLA LETTURA) ────────────────────────
+  // ledger.totali arriva AGGREGATO dal server (incasso/gettoni/ticket): il client NON
+  // ricalcola i totali, li mostra e basta. ledger.righe = ultime ~100 tx (created_at desc).
+  const [ledger, setLedger] = useState<Ledger | null>(null);
+  const [ledgerError, setLedgerError] = useState<string | null>(null);
+  const [ledgerChecked, setLedgerChecked] = useState(false);
+  const [ledgerBusy, setLedgerBusy] = useState(false);
+
+  // ── R8 — Ospiti (lista + drawer, SOLA LETTURA) ──────────────────────────
+  // guests = lista ospiti dal server (saldi/ticket/livello autoritativi dal DB). guestSearch
+  // è SOLO un filtro presentazionale (nome/PIN). selectedGuest = riga aperta nel drawer.
+  const [guests, setGuests] = useState<GuestListRow[]>([]);
+  const [guestsError, setGuestsError] = useState<string | null>(null);
+  const [guestsChecked, setGuestsChecked] = useState(false);
+  const [guestSearch, setGuestSearch] = useState('');
+  const [selectedGuest, setSelectedGuest] = useState<GuestListRow | null>(null);
+
   const staff = isStaffRole(role) && (role === 'regia' || role === 'admin');
+
+  // ── Derivati R7/R8 (memoizzati). Devono stare qui, PRIMA di ogni early return ──
+  // (le regole degli hook vietano useMemo condizionale). Sono pure viste presentazionali
+  // dei dati già ricevuti dal server: nessun ricalcolo di dominio (saldi/ticket/totali).
+  //
+  // Mappa guest_id → nome dalla lista ospiti (R8), riusata dal ledger (R7) per la colonna
+  // "Ospite" e dal CSV (le righe tx portano solo il guest_id).
+  const guestNameById = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const g of guests) m.set(g.id, g.nome);
+    return m;
+  }, [guests]);
+
+  // Filtro presentazionale della lista ospiti (R8): match su nome o PIN, case-insensitive.
+  // SOLO filtro di presentazione — non tocca saldi/ticket/ordinamento (già dal server).
+  const filteredGuests = useMemo(() => {
+    const q = guestSearch.trim().toLowerCase();
+    if (!q) return guests;
+    return guests.filter(
+      (g) => g.nome.toLowerCase().includes(q) || g.pin.toLowerCase().includes(q),
+    );
+  }, [guests, guestSearch]);
+
+  // Timeline tx dell'ospite selezionato (R8 drawer): righe del ledger già ricevute, filtrate
+  // per guest_id. È SOLO una vista delle tx prodotte dal server (nessun ricalcolo). Disponibile
+  // se il ledger è stato caricato (tab Ledger visitato in questa sessione).
+  const selectedGuestTimeline = useMemo(() => {
+    if (!selectedGuest || !ledger) return [];
+    return ledger.righe.filter((r) => r.guest_id === selectedGuest.id);
+  }, [selectedGuest, ledger]);
 
   // Ref alla funzione di fetch stats per usarla dentro lo stream/polling senza
   // ricreare l'effetto ad ogni render (eventId è la sola dipendenza che conta).
@@ -415,6 +532,42 @@ export default function RegiaPage() {
       setLastDrawError(err instanceof Error ? err.message : 'Estrazione non disponibile');
     } finally {
       setLastDrawChecked(true);
+    }
+  }
+
+  // Fetch SOLA LETTURA del ledger (R7): totali AGGREGATI dal server + ultime ~100 righe tx.
+  // NIENTE ricalcolo: i totali (incasso/gettoni/ticket emessi) arrivano già sommati dal DB;
+  // qui non si somma nulla, si mostra. Le righe sono append-only (created_at desc).
+  async function refetchLedger() {
+    const id = eventIdRef.current;
+    if (!id) return;
+    setLedgerBusy(true);
+    try {
+      const l = await getLedger(supabase, { eventId: id });
+      setLedger(l);
+      setLedgerError(null);
+    } catch (err) {
+      setLedgerError(err instanceof Error ? err.message : 'Ledger non disponibile');
+    } finally {
+      setLedgerBusy(false);
+      setLedgerChecked(true);
+    }
+  }
+
+  // Fetch SOLA LETTURA della lista ospiti (R8): saldi/ticket/livello autoritativi dal DB.
+  // Il client NON ricalcola nulla (ticket_totali è GENERATED lato DB); la ricerca è un mero
+  // filtro presentazionale applicato più sotto. La lista arriva già ordinata per nome.
+  async function refetchGuests() {
+    const id = eventIdRef.current;
+    if (!id) return;
+    try {
+      const rows = await getGuestsList(supabase, { eventId: id });
+      setGuests(rows);
+      setGuestsError(null);
+    } catch (err) {
+      setGuestsError(err instanceof Error ? err.message : 'Ospiti non disponibili');
+    } finally {
+      setGuestsChecked(true);
     }
   }
 
@@ -597,6 +750,36 @@ export default function RegiaPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [staff, eventId, tab]);
 
+  // ── Ledger (R7): al primo ingresso nel tab legge totali+righe. SOLA LETTURA, ──
+  // nessun polling (il ledger si ispeziona a fine serata/spot); refresh manuale disponibile.
+  useEffect(() => {
+    if (!staff || !eventId || tab !== 'ledger') return;
+    let active = true;
+    void (async () => {
+      if (!active) return;
+      await refetchLedger();
+    })();
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [staff, eventId, tab]);
+
+  // ── Ospiti (R8): al primo ingresso nel tab legge la lista ospiti. SOLA LETTURA, ──
+  // nessun polling; refresh manuale disponibile. La ricerca è client-side (presentazionale).
+  useEffect(() => {
+    if (!staff || !eventId || tab !== 'ospiti') return;
+    let active = true;
+    void (async () => {
+      if (!active) return;
+      await refetchGuests();
+    })();
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [staff, eventId, tab]);
+
   // Countdown UX locale: scala secondsLeft ogni secondo tra un poll e l'altro (il valore
   // autoritativo resta la scadenza dal server, ri-sincronizzata ad ogni refetchActiveSession).
   useEffect(() => {
@@ -653,6 +836,14 @@ export default function RegiaPage() {
     setDrinksError(null);
     setMenuError(null);
     setMenuFeedback(null);
+    setLedger(null);
+    setLedgerError(null);
+    setLedgerChecked(false);
+    setGuests([]);
+    setGuestsError(null);
+    setGuestsChecked(false);
+    setGuestSearch('');
+    setSelectedGuest(null);
     resetMenuForm();
     setEmail('');
     setPassword('');
@@ -1678,16 +1869,414 @@ export default function RegiaPage() {
           </>
         )}
 
-        {/* ── R7 — Ledger (placeholder) ─────────────────────────────────── */}
+        {/* ── R7 — Ledger / riconciliazione (SOLA LETTURA) ──────────────── */}
         {tab === 'ledger' && (
-          <ComingSoon label="Ledger / riconciliazione: la tabella movimenti e i totali di riconciliazione non sono ancora cablati. In arrivo." />
+          <>
+            {/* Barra azioni: refresh + esporta CSV (delle righe già ricevute). */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+              <div style={{ fontFamily: 'var(--font-ritual)', letterSpacing: '.16em', fontSize: 11, color: C.inkMuted }}>
+                RICONCILIAZIONE MOVIMENTI
+              </div>
+              <div style={{ display: 'flex', gap: 10 }}>
+                <DButton
+                  variant="ghost"
+                  disabled={!eventId || ledgerBusy}
+                  onClick={() => void refetchLedger()}
+                >
+                  {ledgerBusy ? 'Aggiorno…' : 'Aggiorna'}
+                </DButton>
+                <DButton
+                  variant="ghost"
+                  disabled={!ledger || ledger.righe.length === 0}
+                  onClick={() => ledger && exportLedgerCsv(ledger.righe, guestNameById)}
+                >
+                  Esporta CSV
+                </DButton>
+              </div>
+            </div>
+
+            {/* Striscia TOTALI — AGGREGATI dal server (mai ricalcolati nel client). */}
+            <div
+              style={{
+                display: 'flex',
+                gap: 32,
+                flexWrap: 'wrap',
+                padding: '16px 20px',
+                background: C.surface,
+                border: `1px solid ${C.border}`,
+                borderRadius: 14,
+              }}
+            >
+              <div>
+                <span style={{ color: C.inkMuted, fontSize: 13 }}>Incasso ricariche</span>
+                <b style={{ fontFamily: 'var(--font-display)', fontSize: 18, marginLeft: 8, fontVariantNumeric: 'tabular-nums' }}>
+                  {ledger ? fmtEuro(ledger.totali.incasso_euro) : '—'}
+                </b>
+              </div>
+              <div>
+                <span style={{ color: C.inkMuted, fontSize: 13 }}>Gettoni emessi</span>
+                <b style={{ fontFamily: 'var(--font-display)', fontSize: 18, marginLeft: 8, fontVariantNumeric: 'tabular-nums' }}>
+                  {ledger ? fmtInt(ledger.totali.gettoni_emessi) : '—'}
+                </b>
+              </div>
+              <div>
+                <span style={{ color: C.inkMuted, fontSize: 13 }}>Ticket emessi</span>
+                <b style={{ fontFamily: 'var(--font-display)', fontSize: 18, marginLeft: 8, color: C.gold, fontVariantNumeric: 'tabular-nums' }}>
+                  {ledger ? fmtInt(ledger.totali.ticket_emessi) : '—'}
+                </b>
+              </div>
+            </div>
+
+            {ledgerError && <Note kind="err">Ledger non disponibile: {ledgerError}</Note>}
+
+            {/* Tabella append-only (cifre tabellari). Header + righe (created_at desc). */}
+            <div style={panel}>
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: '90px 1fr 1.2fr 1fr 110px 110px 120px',
+                  gap: 12,
+                  padding: '0 14px 12px',
+                  fontFamily: 'var(--font-ritual)',
+                  letterSpacing: '.08em',
+                  fontSize: 11,
+                  color: C.inkMuted,
+                }}
+              >
+                <div>ORA</div>
+                <div>TIPO</div>
+                <div>OSPITE</div>
+                <div>OPERATORE</div>
+                <div style={{ textAlign: 'right' }}>Δ GETTONI</div>
+                <div style={{ textAlign: 'right' }}>Δ TICKET</div>
+                <div style={{ textAlign: 'right' }}>IMPORTO</div>
+              </div>
+
+              {/* Stato di caricamento / vuoto coerente. */}
+              {eventId && !ledgerChecked && (
+                <p style={{ margin: '6px 0 0', color: C.inkMuted, fontSize: 14 }}>Carico i movimenti…</p>
+              )}
+              {ledgerChecked && !ledgerError && ledger && ledger.righe.length === 0 && (
+                <p style={{ margin: '6px 0 0', color: C.inkMuted, fontSize: 14 }}>
+                  Nessun movimento registrato per questo evento.
+                </p>
+              )}
+
+              {ledger &&
+                ledger.righe.map((r) => {
+                  const chip = LEDGER_TIPO_CHIP[r.tipo];
+                  const gColor = r.qta_delta > 0 ? C.green : r.qta_delta < 0 ? EMBER : C.inkMuted;
+                  return (
+                    <div
+                      key={r.id}
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: '90px 1fr 1.2fr 1fr 110px 110px 120px',
+                        gap: 12,
+                        alignItems: 'center',
+                        padding: '13px 14px',
+                        borderBottom: `1px solid ${C.border}`,
+                        fontSize: 13.5,
+                        fontVariantNumeric: 'tabular-nums',
+                      }}
+                    >
+                      <div style={{ color: C.inkSoft }}>
+                        {new Date(r.created_at).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' })}
+                      </div>
+                      <div>
+                        <span
+                          style={{
+                            fontFamily: 'var(--font-ritual)',
+                            fontSize: 10,
+                            letterSpacing: '.06em',
+                            border: `1px solid ${chip.border}`,
+                            color: chip.color,
+                            borderRadius: 6,
+                            padding: '4px 8px',
+                            textTransform: 'uppercase',
+                          }}
+                        >
+                          {r.tipo}
+                          {r.tipo_consumazione ? ` · ${r.tipo_consumazione}` : ''}
+                        </span>
+                      </div>
+                      <div style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {guestNameById.get(r.guest_id) ?? (
+                          <span style={{ color: C.inkMuted, fontFamily: 'var(--font-ui)' }}>
+                            {r.guest_id.slice(0, 8)}…
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ color: C.inkSoft, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {r.operatore ? r.operatore.slice(0, 8) + '…' : 'ospite'}
+                      </div>
+                      <div style={{ textAlign: 'right', color: gColor }}>
+                        {r.qta_delta !== 0 ? fmtDelta(r.qta_delta) : '—'}
+                      </div>
+                      <div style={{ textAlign: 'right', color: r.ticket_delta > 0 ? C.gold : C.inkMuted }}>
+                        {r.ticket_delta !== 0 ? fmtDelta(r.ticket_delta) : '—'}
+                      </div>
+                      <div style={{ textAlign: 'right', color: C.inkSoft }}>
+                        {r.importo_euro !== null ? fmtEuro(Number(r.importo_euro)) : '—'}
+                      </div>
+                    </div>
+                  );
+                })}
+
+              {ledger && ledger.righe.length >= 100 && (
+                <p style={{ margin: '12px 0 0', color: C.inkMuted, fontSize: 12.5 }}>
+                  Mostrate le ultime 100 righe (più recenti). I totali coprono l&apos;intero evento.
+                </p>
+              )}
+            </div>
+          </>
         )}
 
-        {/* ── R8 — Ospiti (placeholder) ─────────────────────────────────── */}
+        {/* ── R8 — Ospiti (lista + drawer dettaglio, SOLA LETTURA) ──────── */}
         {tab === 'ospiti' && (
-          <ComingSoon label="Ospiti: lista e dettaglio ospite (con storico transazioni) non ancora cablati. In arrivo." />
+          <>
+            {/* Barra: ricerca (client-side, presentazionale) + refresh. */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+              <input
+                type="search"
+                aria-label="Cerca ospite per nome o PIN"
+                placeholder="Cerca per nome o PIN…"
+                value={guestSearch}
+                onChange={(e) => setGuestSearch(e.target.value)}
+                style={{ ...inputStyle, width: 280 }}
+              />
+              <DButton variant="ghost" disabled={!eventId} onClick={() => void refetchGuests()}>
+                Aggiorna
+              </DButton>
+            </div>
+
+            {guestsError && <Note kind="err">Ospiti non disponibili: {guestsError}</Note>}
+
+            <div style={panel}>
+              {/* Header tabella. */}
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: '1.4fr 90px 90px 90px 110px 1fr',
+                  gap: 12,
+                  padding: '0 14px 12px',
+                  fontFamily: 'var(--font-ritual)',
+                  letterSpacing: '.08em',
+                  fontSize: 11,
+                  color: C.inkMuted,
+                }}
+              >
+                <div>NOME</div>
+                <div>PIN</div>
+                <div>NORM.</div>
+                <div>PREM.</div>
+                <div>TICKET</div>
+                <div>LIVELLO TOTEM</div>
+              </div>
+
+              {/* Stato caricamento / vuoto. */}
+              {eventId && !guestsChecked && (
+                <p style={{ margin: '6px 0 0', color: C.inkMuted, fontSize: 14 }}>Carico gli ospiti…</p>
+              )}
+              {guestsChecked && !guestsError && guests.length === 0 && (
+                <p style={{ margin: '6px 0 0', color: C.inkMuted, fontSize: 14 }}>
+                  Nessun ospite registrato per questo evento.
+                </p>
+              )}
+              {guestsChecked && !guestsError && guests.length > 0 && filteredGuests.length === 0 && (
+                <p style={{ margin: '6px 0 0', color: C.inkMuted, fontSize: 14 }}>
+                  Nessun ospite corrisponde a “{guestSearch}”.
+                </p>
+              )}
+
+              {filteredGuests.map((g) => {
+                const isSel = selectedGuest?.id === g.id;
+                // Barra livello proporzionale (0..6): SOLO presentazionale, il livello è dal DB.
+                const lvlPct = Math.round((Math.max(0, Math.min(6, g.livello_totem)) / 6) * 100);
+                return (
+                  <div
+                    key={g.id}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`Dettaglio ospite ${g.nome}`}
+                    onClick={() => setSelectedGuest(g)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setSelectedGuest(g);
+                      }
+                    }}
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: '1.4fr 90px 90px 90px 110px 1fr',
+                      gap: 12,
+                      alignItems: 'center',
+                      padding: '13px 14px',
+                      borderRadius: 9,
+                      background: isSel ? 'rgba(58,91,190,.14)' : 'transparent',
+                      borderBottom: `1px solid ${C.border}`,
+                      fontSize: 14,
+                      cursor: 'pointer',
+                      fontVariantNumeric: 'tabular-nums',
+                    }}
+                  >
+                    <div style={{ fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {g.nome || '—'}
+                    </div>
+                    <div style={{ color: C.inkSoft }}>{g.pin}</div>
+                    <div>{g.saldo_normale}</div>
+                    <div style={{ color: '#9BB6EC' }}>{g.saldo_premium}</div>
+                    <div style={{ color: C.gold, fontWeight: 600 }}>{g.ticket_totali}</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <div style={{ flex: 1, maxWidth: 120, height: 7, borderRadius: 99, background: '#20140B' }}>
+                        <div
+                          style={{
+                            height: '100%',
+                            width: `${lvlPct}%`,
+                            borderRadius: 99,
+                            background: `linear-gradient(90deg, ${C.blue}, ${C.gold})`,
+                          }}
+                        />
+                      </div>
+                      <span style={{ fontFamily: 'var(--font-ritual)', fontSize: 11, color: C.gold }}>
+                        L{g.livello_totem}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </>
         )}
       </div>
+
+      {/* ── R8 drawer dettaglio ospite (overlay, sola lettura) ──────────── */}
+      {tab === 'ospiti' && selectedGuest && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Dettaglio ospite ${selectedGuest.nome}`}
+          style={{ position: 'fixed', inset: 0, zIndex: 50, display: 'flex', justifyContent: 'flex-end' }}
+        >
+          {/* Scrim: click fuori → chiude. */}
+          <div
+            onClick={() => setSelectedGuest(null)}
+            style={{ position: 'absolute', inset: 0, background: 'rgba(9,5,2,.55)' }}
+          />
+          <aside
+            style={{
+              position: 'relative',
+              width: 420,
+              maxWidth: '100%',
+              height: '100%',
+              overflowY: 'auto',
+              background: C.surface,
+              borderLeft: `1px solid ${C.border}`,
+              padding: 28,
+              boxShadow: '-20px 0 60px rgba(0,0,0,.4)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
+              <div>
+                <div style={{ fontFamily: 'var(--font-display)', fontSize: 28, letterSpacing: '.02em', wordBreak: 'break-word' }}>
+                  {selectedGuest.nome || '—'}
+                </div>
+                <div style={{ fontSize: 13, color: C.inkMuted, marginTop: 2 }}>PIN {selectedGuest.pin}</div>
+              </div>
+              <button
+                type="button"
+                aria-label="Chiudi dettaglio"
+                onClick={() => setSelectedGuest(null)}
+                style={{ background: 'transparent', border: 'none', color: '#7E6A52', fontSize: 22, cursor: 'pointer', lineHeight: 1 }}
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Mini-totem al livello attuale (dal DB, mai ricalcolato). */}
+            <div style={{ display: 'flex', justifyContent: 'center', margin: '16px 0' }}>
+              <Totem level={selectedGuest.livello_totem} size={150} />
+            </div>
+
+            {/* Saldi + ticket (sola lettura). */}
+            <div style={{ display: 'flex', gap: 10 }}>
+              <div style={{ flex: 1, background: '#1B0F07', border: `1px solid ${C.border}`, borderRadius: 10, padding: 12, textAlign: 'center' }}>
+                <div style={{ fontFamily: 'var(--font-display)', fontSize: 20 }}>{selectedGuest.saldo_normale}</div>
+                <div style={{ fontSize: 10, color: C.inkMuted, letterSpacing: '.1em' }}>NORMALI</div>
+              </div>
+              <div style={{ flex: 1, background: '#1B0F07', border: '1px solid #5E83CE66', borderRadius: 10, padding: 12, textAlign: 'center' }}>
+                <div style={{ fontFamily: 'var(--font-display)', fontSize: 20, color: '#9BB6EC' }}>{selectedGuest.saldo_premium}</div>
+                <div style={{ fontSize: 10, color: C.goldSoft, letterSpacing: '.1em' }}>PREMIUM</div>
+              </div>
+              <div style={{ flex: 1, background: 'rgba(216,154,62,.08)', border: '1px solid rgba(216,154,62,.3)', borderRadius: 10, padding: 12, textAlign: 'center' }}>
+                <div style={{ fontFamily: 'var(--font-display)', fontSize: 20, color: C.gold }}>{selectedGuest.ticket_totali}</div>
+                <div style={{ fontSize: 10, color: C.gold, letterSpacing: '.1em' }}>TICKET</div>
+              </div>
+            </div>
+
+            {/* Livello totem (etichetta). */}
+            <div style={{ marginTop: 14, textAlign: 'center', fontSize: 13, color: C.inkSoft }}>
+              Livello totem: <b style={{ color: C.gold, fontFamily: 'var(--font-ritual)' }}>L{selectedGuest.livello_totem}</b>
+            </div>
+
+            {/* Timeline transazioni: righe del ledger filtrate per guest_id (se caricato). */}
+            <div style={{ fontFamily: 'var(--font-ritual)', letterSpacing: '.14em', fontSize: 11, color: C.inkMuted, margin: '22px 0 12px' }}>
+              TIMELINE
+            </div>
+            {!ledger ? (
+              <p style={{ margin: 0, color: C.inkMuted, fontSize: 13 }}>
+                Apri il tab Ledger per caricare i movimenti: la timeline delle transazioni dell&apos;ospite comparirà qui.
+              </p>
+            ) : selectedGuestTimeline.length === 0 ? (
+              <p style={{ margin: 0, color: C.inkMuted, fontSize: 13 }}>
+                Nessun movimento recente per questo ospite (fra le ultime 100 righe del ledger).
+              </p>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {selectedGuestTimeline.map((r) => {
+                  const chip = LEDGER_TIPO_CHIP[r.tipo];
+                  // Delta mostrato nel drawer: ticket se presente, altrimenti gettoni.
+                  const deltaVal = r.ticket_delta !== 0 ? r.ticket_delta : r.qta_delta;
+                  const deltaColor = deltaVal > 0 ? C.gold : deltaVal < 0 ? EMBER : C.inkMuted;
+                  return (
+                    <div key={r.id} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <div
+                        style={{
+                          width: 26,
+                          height: 26,
+                          borderRadius: 7,
+                          background: 'rgba(255,255,255,.04)',
+                          border: `1px solid ${chip.border}`,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          fontSize: 10,
+                          color: chip.color,
+                          fontFamily: 'var(--font-ritual)',
+                        }}
+                        aria-hidden
+                      >
+                        {r.tipo.slice(0, 2).toUpperCase()}
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0, fontSize: 13 }}>
+                        <span style={{ textTransform: 'capitalize' }}>{r.tipo}</span>
+                        {r.tipo_consumazione ? ` · ${r.tipo_consumazione}` : ''}
+                        <span style={{ color: C.inkMuted, marginLeft: 6, fontSize: 11.5 }}>
+                          {new Date(r.created_at).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                      </div>
+                      <div style={{ fontSize: 12, color: deltaColor, fontVariantNumeric: 'tabular-nums' }}>
+                        {r.ticket_delta !== 0 ? `${fmtDelta(r.ticket_delta)} tk` : fmtDelta(r.qta_delta)}
+                        {r.importo_euro !== null ? ` · ${fmtEuro(Number(r.importo_euro))}` : ''}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </aside>
+        </div>
+      )}
     </RegiaShell>
   );
 }

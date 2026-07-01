@@ -49,6 +49,32 @@ export type EventStats = {
   ticket_totali: number;
 };
 
+// Riga transactions esposta al ledger di regia (sola lettura, append-only lato DB).
+// Colonne reali da supabase/migrations/0001_init.sql, tabella public.transactions.
+export type LedgerRow = {
+  id: string;
+  created_at: string;
+  tipo: 'ricarica' | 'consumo' | 'conversione' | 'tap';
+  tipo_consumazione: TipoConsumazione | null; // 'normale' | 'premium' | null
+  qta_delta: number; // + ricarica, - consumo
+  ticket_delta: number;
+  importo_euro: number | null; // valorizzato solo sulle 'ricarica'
+  operatore: string | null; // auth.uid() di cassa/regia, null se ospite
+  guest_id: string;
+};
+
+// Totali del ledger, AGGREGATI dal DB (mai ricalcolati nel client):
+//   incasso_euro   = somma importo_euro delle 'ricarica'
+//   gettoni_emessi = somma dei qta_delta positivi
+//   ticket_emessi  = somma dei ticket_delta positivi
+export type LedgerTotali = {
+  incasso_euro: number;
+  gettoni_emessi: number;
+  ticket_emessi: number;
+};
+
+export type Ledger = { totali: LedgerTotali; righe: LedgerRow[] };
+
 // Errore applicativo uniforme: nasconde la differenza PostgREST/Supabase/route /api
 // e porta un messaggio leggibile + il codice per i casi gestibili a UI.
 export class RpcError extends Error {
@@ -447,6 +473,68 @@ export async function getEventStats(
   const row = Array.isArray(data) ? data[0] : data;
   if (!row) throw new RpcError('event_stats non ha restituito statistiche');
   return row as EventStats;
+}
+
+// getLedger -> ledger/riconciliazione di regia: TOTALI aggregati (incasso €, gettoni
+// emessi, ticket emessi) + le ultime ~100 righe transactions (created_at desc). Sola lettura
+// sotto la RLS staff (append-only). Il front-end NON ricalcola saldi/ticket: i totali sono
+// aggregati dal DB. Gate: staff (regia/admin) lato route/RLS.
+//
+// Branch USE_API:
+//   - API: GET /api/regia/ledger?event=<id> → { totali, righe } (totali aggregati in SQL con
+//     sum/filter; righe = ultime 100 desc). Gate ruolo regia/admin server-side.
+//   - supabase (INVARIATO nello stile = listDrinks): DUE select dirette su transactions sotto
+//     la policy tx_select (is_staff). PostgREST non espone `sum(...) filter (where ...)`, quindi:
+//       1) righe  = select mirata (le colonne del ledger), order created_at desc, limit 100;
+//       2) totali = select del SET COMPLETO delle sole colonne numeriche (tipo, qta_delta,
+//          ticket_delta, importo_euro) e somma qui — lecito perché il set è COMPLETO
+//          (nessun limit): i totali restano fedeli a tutto l'evento, non solo alle 100 righe.
+export async function getLedger(
+  supabase: SupabaseClient,
+  args: { eventId: string },
+): Promise<Ledger> {
+  if (USE_API) {
+    return apiGet<Ledger>(`/api/regia/ledger?event=${encodeURIComponent(args.eventId)}`);
+  }
+
+  const { data: righeData, error: righeErr } = await supabase
+    .from('transactions')
+    .select(
+      'id, created_at, tipo, tipo_consumazione, qta_delta, ticket_delta, importo_euro, operatore, guest_id',
+    )
+    .eq('event_id', args.eventId)
+    .order('created_at', { ascending: false })
+    .limit(100);
+  if (righeErr) rethrow(righeErr);
+
+  // Set COMPLETO (niente limit) delle sole colonne numeriche → i totali coprono tutto
+  // l'evento. La somma qui è aggregazione di un set completo dal DB, non un ricalcolo di
+  // saldi/ticket lato client (quelli restano su public.guests, autoritativi dal DB).
+  const { data: aggData, error: aggErr } = await supabase
+    .from('transactions')
+    .select('tipo, qta_delta, ticket_delta, importo_euro')
+    .eq('event_id', args.eventId);
+  if (aggErr) rethrow(aggErr);
+
+  type AggRow = {
+    tipo: string;
+    qta_delta: number | null;
+    ticket_delta: number | null;
+    importo_euro: number | null;
+  };
+  const totali = ((aggData as AggRow[] | null) ?? []).reduce<LedgerTotali>(
+    (acc, r) => {
+      if (r.tipo === 'ricarica') acc.incasso_euro += Number(r.importo_euro) || 0;
+      const q = Number(r.qta_delta) || 0;
+      if (q > 0) acc.gettoni_emessi += q;
+      const t = Number(r.ticket_delta) || 0;
+      if (t > 0) acc.ticket_emessi += t;
+      return acc;
+    },
+    { incasso_euro: 0, gettoni_emessi: 0, ticket_emessi: 0 },
+  );
+
+  return { totali, righe: (righeData as LedgerRow[] | null) ?? [] };
 }
 
 // Esito estrazione dell'OSPITE chiamante (reveal G10). Sola lettura, guest-safe:
