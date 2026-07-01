@@ -6,6 +6,11 @@ Tutte le modifiche rilevanti a **Totem Night**. Formato: [Keep a Changelog](http
 
 ## [Unreleased]
 
+### Go-live prod — deploy routing + rotazione secret ✅
+- **Deploy prod** (`railway up`, commit `f67ba01`): routing `/` + `/gestore` live e verificati (`/gestore` 200 con tile Cassa/Regia, `/` 200 splash+redirect, `/onboarding` 200).
+- **Rotazione secret pre-pubblico** (secret erano stati esposti in chat): nuovo `JWT_SECRET` sul servizio web Railway → redeploy → **tutti i token pregressi invalidati** (staff + ospiti riloggano). Password staff **rigenerate** (argon2id m=19456/t=2/p=1) e verificate via `argon2.verify` post-update; login prod ok (cassa/regia → 200, pass errata → 401). Le nuove credenziali consegnate all'utente fuori dal repo (mai committate).
+- **Reseed mock**: 14 guest + 29 transactions mock ancora in prod → wipe DEFERITO in attesa di conferma esplicita (azione irreversibile). Catalogo drinks (3) ed evento (1) preservati.
+
 ### Routing dominio — ingresso cliente `/` + chooser staff `/gestore` ✅
 - **Workflow multi-agente** (build → review hull `code-reviewer`, verdict ok). Prepara la struttura `dominio.com/x`: sezione cliente e sezione gestore separate per path.
 - **`/` = ingresso CLIENTE**: splash 'use client' (kicker + wordmark + Totem acceso + tagline + loader) che su mount **smista SEMPRE**: `loadGuestId()` → `router.replace('/guest')` se sessione presente, altrimenti `/onboarding`. localStorage letto solo lato client (dentro `useEffect`): render SSR = primo render client (splash puro) → nessun mismatch d'idratazione. Failsafe `setTimeout(900ms)` + guard `routedRef` → redirect garantito, niente doppio-navigate né deadlock. `replace` (non push) → splash fuori dalla history.
