@@ -493,3 +493,51 @@ export async function getGuestsList(
   if (error) rethrow(error);
   return (data as GuestListRow[] | null) ?? [];
 }
+
+// Un punto della serie "Consumi per fascia oraria" (R1 dashboard): etichetta ora ('HH:00')
+// e numero di CONSUMI in quella fascia. Entrambi autoritativi lato DB — il conteggio è
+// count(*) aggregato dal server, il client NON somma nulla, disegna solo l'area-chart.
+export type ConsumiTimelinePoint = { ora: string; consumi: number };
+
+// getConsumiTimeline(...) -> serie consumi/ora dell'evento: [{ ora, consumi }] ordinata
+// cronologicamente. Sola lettura, NIENTE ricalcolo: i conteggi per fascia arrivano già
+// aggregati dal DB (una riga per ora). Alimenta l'area-chart della dashboard di regia (R1),
+// che va disegnato DA QUESTI PUNTI (mai un path finto). Gate: staff (regia/admin) lato route/RLS.
+//
+// Branch USE_API:
+//   - API: GET /api/regia/consumi-timeline?event=<id> → ConsumiTimelinePoint[] (gate ruolo
+//     regia/admin server-side; group by ora + order nella query SQL).
+//   - supabase (INVARIATO nello stile = getLedger): PostgREST non espone group by/count nella
+//     select, quindi leggiamo il SET COMPLETO dei soli created_at dei CONSUMI (event_id + tipo)
+//     e li bucketizziamo per ora QUI. È aggregazione di un set completo dal DB (nessun limit),
+//     non un ricalcolo di dominio: i saldi/ticket restano autoritativi su public.guests.
+export async function getConsumiTimeline(
+  supabase: SupabaseClient,
+  args: { eventId: string },
+): Promise<ConsumiTimelinePoint[]> {
+  if (USE_API) {
+    return apiGet<ConsumiTimelinePoint[]>(
+      `/api/regia/consumi-timeline?event=${encodeURIComponent(args.eventId)}`,
+    );
+  }
+
+  // Set COMPLETO (niente limit) dei soli created_at delle transazioni di CONSUMO: il
+  // bucketing per ora sotto è fedele a tutto l'evento. RLS tx_select (is_staff) copre la lettura.
+  const { data, error } = await supabase
+    .from('transactions')
+    .select('created_at')
+    .eq('event_id', args.eventId)
+    .eq('tipo', 'consumo')
+    .order('created_at', { ascending: true });
+  if (error) rethrow(error);
+
+  // Bucket per ORA locale del timestamp, etichetta 'HH:00' (0..23 con zero-pad). Manteniamo
+  // l'ordine cronologico d'inserimento nella Map (l'ordinamento della query è per created_at).
+  const buckets = new Map<string, number>();
+  for (const r of (data as { created_at: string }[] | null) ?? []) {
+    const d = new Date(r.created_at);
+    const ora = `${String(d.getHours()).padStart(2, '0')}:00`;
+    buckets.set(ora, (buckets.get(ora) ?? 0) + 1);
+  }
+  return Array.from(buckets, ([ora, consumi]) => ({ ora, consumi }));
+}

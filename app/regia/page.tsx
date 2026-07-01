@@ -24,6 +24,7 @@ import {
   RegiaDashboard,
   type RegiaTab,
   type Kpi,
+  type ConsumiPoint,
 } from '@/components/screens/Regia';
 import Totem from '@/components/Totem';
 import { createClient } from '@/lib/supabase/client';
@@ -61,6 +62,7 @@ import {
   getLastDraw,
   getDrawHistory,
   getGuestsList,
+  getConsumiTimeline,
   type Phase,
   type LeaderboardRow,
   type LastDraw,
@@ -349,6 +351,11 @@ export default function RegiaPage() {
   const [stats, setStats] = useState<EventStats | null>(null);
   const [statsError, setStatsError] = useState<string | null>(null);
 
+  // ── R1 — Consumi per fascia oraria (dashboard) — SOLA LETTURA ───────────
+  // Serie [{ ora, consumi }] aggregata dal server (count consumi per fascia). Il client NON
+  // somma nulla: l'area-chart si disegna DA QUESTI PUNTI (serie vuota → empty-state).
+  const [consumiTimeline, setConsumiTimeline] = useState<ConsumiPoint[]>([]);
+
   // ── Controlli (muta-stato) ──────────────────────────────────────────────
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -498,6 +505,21 @@ export default function RegiaPage() {
       setStatsError(null);
     } catch (err) {
       setStatsError(err instanceof Error ? err.message : 'Statistiche non disponibili');
+    }
+  }
+
+  // Fetch SOLA LETTURA della serie consumi/ora (R1 dashboard): [{ ora, consumi }] aggregata
+  // dal server. NIENTE ricalcolo: il conteggio per fascia è count(*) del DB; qui si setta e
+  // basta (l'area-chart la disegna il componente dai punti reali). In errore azzera la serie
+  // → empty-state "Dati non disponibili" invece di un grafico stantìo/finto.
+  async function refetchConsumiTimeline() {
+    const id = eventIdRef.current;
+    if (!id) return;
+    try {
+      const serie = await getConsumiTimeline(supabase, { eventId: id });
+      setConsumiTimeline(serie);
+    } catch {
+      setConsumiTimeline([]);
     }
   }
 
@@ -835,6 +857,29 @@ export default function RegiaPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [staff, eventId, tab]);
 
+  // ── Dashboard (R1): consumi per fascia oraria. Solo quando il tab 'dashboard' è aperto ──
+  // (niente polling di fondo altrove). SOLA LETTURA: getConsumiTimeline (serie aggregata dal
+  // DB). Refresh sulla stessa cadenza read-only del resto (~3s) così il grafico segue i consumi
+  // che entrano durante la serata. In modalità API+SSE le stats arrivano in push, ma questa
+  // serie non ha un evento stream dedicato: un poll leggero copre l'aggiornamento del grafico.
+  useEffect(() => {
+    if (!staff || !eventId || tab !== 'dashboard') return;
+    let active = true;
+
+    void refetchConsumiTimeline();
+
+    const timer = setInterval(() => {
+      if (!active) return;
+      void refetchConsumiTimeline();
+    }, POLL_MS);
+
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [staff, eventId, tab]);
+
   // Countdown UX locale: scala secondsLeft ogni secondo tra un poll e l'altro (il valore
   // autoritativo resta la scadenza dal server, ri-sincronizzata ad ogni refetchActiveSession).
   useEffect(() => {
@@ -876,6 +921,7 @@ export default function RegiaPage() {
     setEventChecked(false);
     setStats(null);
     setStatsError(null);
+    setConsumiTimeline([]);
     setActionError(null);
     setFeedback(null);
     setNWinners(3);
@@ -1253,7 +1299,7 @@ export default function RegiaPage() {
     ];
     return (
       <div style={{ position: 'relative' }}>
-        <RegiaDashboard kpis={kpis} tx={[]} stato={statoPill} onNav={setTab} />
+        <RegiaDashboard kpis={kpis} tx={[]} consumiTimeline={consumiTimeline} stato={statoPill} onNav={setTab} />
         {/* overlay sopra la topbar della dashboard: Esci + eventuali errori/banner */}
         <div style={{ position: 'absolute', top: 18, right: 32, display: 'flex', gap: 12, alignItems: 'center' }}>
           <span style={{ color: C.inkMuted, fontSize: 13 }}>Ruolo: {role}</span>

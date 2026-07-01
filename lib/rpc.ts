@@ -76,6 +76,19 @@ export type LedgerTotali = {
 
 export type Ledger = { totali: LedgerTotali; righe: LedgerRow[] };
 
+// Riga transazione dell'OSPITE per la vista MOVIMENTI (G6). Sola lettura, guest-safe:
+// sono le SOLE colonne presentazionali necessarie (nessun importo €, nessun operatore).
+// Il mapping riga → presentazione (icona/label/delta) avviene lato client SENZA sommare
+// nulla: qta_delta/ticket_delta/tipo_consumazione sono già i valori AUTORITATIVI dal DB.
+export type GuestTxRow = {
+  id: string;
+  created_at: string;
+  tipo: 'ricarica' | 'consumo' | 'conversione' | 'tap';
+  tipo_consumazione: TipoConsumazione | null; // 'normale' | 'premium' | null
+  qta_delta: number; // + ricarica, - consumo
+  ticket_delta: number; // + conversione/tap
+};
+
 // Anteprima conversione credito → ticket dell'ospite chiamante (sola lettura, guest-safe).
 //   saldo_normale / saldo_premium — credito residuo (int, dal DB su public.guests)
 //   ticket_preview — ticket che si otterrebbero convertendo ORA, calcolato con i tassi
@@ -392,6 +405,38 @@ export async function getConvertPreview(
     saldo_normale * (Number(e.ticket_conversione_normale) || 0) +
     saldo_premium * (Number(e.ticket_conversione_premium) || 0);
   return { saldo_normale, saldo_premium, ticket_preview };
+}
+
+// getGuestTransactions(...) -> storico movimenti dell'OSPITE chiamante (vista MOVIMENTI G6),
+// ultime ~50 righe (created_at desc). Sola LETTURA, guest-safe: la RLS tx_select espone
+// all'ospite SOLO le proprie transazioni (guest_id via auth.uid()), quindi filtriamo per
+// event_id e la RLS restringe automaticamente al chiamante — NON serve passare il guest_id.
+// Il client NON somma/inventa nulla: mappa queste righe REALI al type presentazionale.
+//
+// Branch USE_API:
+//   - API: GET /api/guest/transactions?event=<id> → GuestTxRow[] (gate requireAuth server-side,
+//     ospite incluso; la RLS filtra alle sole righe del chiamante).
+//   - supabase: select diretta su transactions sotto la policy tx_select. auth.uid() non è
+//     disponibile qui, quindi filtriamo per event_id e ci affidiamo alla RLS che espone SOLO
+//     le righe del chiamante (identico approccio a getConvertPreview).
+export async function getGuestTransactions(
+  supabase: SupabaseClient,
+  args: { eventId: string },
+): Promise<GuestTxRow[]> {
+  if (USE_API) {
+    return apiGet<GuestTxRow[]>(
+      `/api/guest/transactions?event=${encodeURIComponent(args.eventId)}`,
+    );
+  }
+
+  const { data, error } = await supabase
+    .from('transactions')
+    .select('id, created_at, tipo, tipo_consumazione, qta_delta, ticket_delta')
+    .eq('event_id', args.eventId)
+    .order('created_at', { ascending: false })
+    .limit(50);
+  if (error) rethrow(error);
+  return (data as GuestTxRow[] | null) ?? [];
 }
 
 // lookupGuestByPin -> riga guests dell'ospite col PIN dato, o null se non esiste.

@@ -34,7 +34,9 @@ const RIGHE_LIMIT = 100;
 export async function GET(req: Request): Promise<NextResponse> {
   if (!sameOriginOk(req)) return NextResponse.json({ error: 'forbidden' }, { status: 403 });
   try {
-    const claims = await requireRole(req, ['regia', 'admin']);
+    // Cassa inclusa: è staff (RLS tx_select = is_staff() già le consente la lettura) e la
+    // home cassa mostra i totali reali (incasso/gettoni) tramite questo endpoint.
+    const claims = await requireRole(req, ['cassa', 'regia', 'admin']);
 
     const url = new URL(req.url);
     const event = (url.searchParams.get('event') ?? '').trim();

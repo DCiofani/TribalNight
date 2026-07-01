@@ -5,8 +5,8 @@
 // Cablaggio guest-merge: il MENÙ è REALE (catalogo public.drinks, sole voci visibili
 // all'ospite via listVisibleDrinks) + reagisce alla FASE dell'evento (autoritativa dal
 // server via getCurrentEventState / evento SSE `phase`). DrinkRow → MenuItem qui sotto.
-// I MOVIMENTI restano placeholder (DEMO_TX): non esiste ancora un wrapper storico
-// transazioni per l'ospite (vedi gaps). Nessun dato/somma inventato lato client.
+// I MOVIMENTI sono REALI: getGuestTransactions legge le transazioni dell'ospite (RLS
+// tx_select → solo le proprie) e le mappa al type presentazionale SENZA sommare nulla.
 'use client';
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
@@ -21,8 +21,10 @@ import {
   convertCredit,
   getConvertPreview,
   getMyDrawResult,
+  getGuestTransactions,
   RpcError,
   type DrinkRow,
+  type GuestTxRow,
 } from '@/lib/rpc';
 import { getCurrentEventState } from '@/lib/events';
 import { USE_API } from '@/lib/backend-mode';
@@ -139,16 +141,84 @@ const PHASE_NOTICE: Record<string, string> = {
   CHIUSA: 'Evento concluso: il bar è chiuso. Lo stato qui sotto è quello finale.',
 };
 
-// Movimenti reali: NON esiste (ancora) un wrapper storico transazioni per l'ospite.
-// Lasciamo i dati placeholder in stile design — vedi gaps. Nessuna somma inventata.
-const DEMO_TX: Tx[] = [
-  { icon: '🍸', iconBg: '#22315C', label: 'Negroni Tribale', time: '23:14', delta: '−1 premium', deltaColor: '#9BB6EC' },
-  { icon: '🥃', iconBg: '#3A2414', label: 'Birra alla spina', time: '22:58', delta: '−1 normale', deltaColor: '#D8C3A6' },
-  { icon: '⬆', iconBg: '#2A4A3A', label: 'Ricarica cassa', time: '22:30', delta: '+5 normali', deltaColor: '#34D399' },
-  { icon: '🎟', iconBg: '#3A2A14', label: 'Ticket serata', time: '22:30', delta: '+12 ticket', deltaColor: '#F2B43C' },
-  { icon: '🍸', iconBg: '#22315C', label: 'Spritz Savana', time: '22:05', delta: '−1 normale', deltaColor: '#D8C3A6' },
-  { icon: '🥃', iconBg: '#3A2414', label: 'Mezcal Ember', time: '21:40', delta: '−1 premium', deltaColor: '#9BB6EC' },
-];
+// Polling blando dello storico movimenti (sola lettura) mentre la vista MOVIMENTI è aperta:
+// le transazioni cambiano quando la cassa registra ricariche/consumi, quindi un refresh
+// periodico basta. Il conteggio autoritativo resta nel DB (RLS tx_select).
+const TX_POLL_MS = 8000;
+
+// Colori delta coerenti col design (stessi toni dei tag menù/mockup). Puramente estetici.
+const TX_COLOR_TICKET = '#F2B43C'; // oro → ticket (conversione/tap)
+const TX_COLOR_POSITIVO = '#34D399'; // verde → ricarica (+ gettoni)
+const TX_COLOR_PREMIUM = '#9BB6EC'; // blu → consumo premium
+const TX_COLOR_NORMALE = '#D8C3A6'; // ambra → consumo normale
+
+// GuestTxRow (DB) → Tx (presentazione). SOLA LETTURA: i valori (qta_delta/ticket_delta/
+// tipo_consumazione) sono AUTORITATIVI dal server; qui NON si somma/inventa nulla, si
+// formatta soltanto (icona/label/segno del delta già presente nella riga, orario da created_at).
+function txTime(createdAt: string): string {
+  const d = new Date(createdAt);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+}
+
+// Etichetta plurale coerente ("1 normale" / "2 normali") senza calcoli: solo formattazione
+// del valore già fornito dal DB.
+function plural(n: number, singolare: string, plurale: string): string {
+  return Math.abs(n) === 1 ? singolare : plurale;
+}
+
+function toTx(row: GuestTxRow): Tx {
+  const time = txTime(row.created_at);
+  // Segno esplicito: usiamo il segno REALE del delta dal DB (non lo ricalcoliamo).
+  const seg = (n: number) => (n > 0 ? `+${n}` : `${n}`); // n<0 porta già il '-'
+  switch (row.tipo) {
+    case 'ricarica':
+      // Ricarica cassa: qta_delta > 0 gettoni del tipo indicato.
+      return {
+        icon: '⬆',
+        iconBg: '#2A4A3A',
+        label: 'Ricarica cassa',
+        time,
+        delta: `${seg(row.qta_delta)} ${plural(row.qta_delta, 'gettone', 'gettoni')}${
+          row.tipo_consumazione ? ` ${row.tipo_consumazione}` : ''
+        }`,
+        deltaColor: TX_COLOR_POSITIVO,
+      };
+    case 'consumo': {
+      // Consumo al bar: qta_delta < 0 sul tipo del drink. Colore per tipo consumazione.
+      const premium = row.tipo_consumazione === 'premium';
+      return {
+        icon: '🍸',
+        iconBg: premium ? '#22315C' : '#3A2414',
+        label: premium ? 'Consumazione premium' : 'Consumazione normale',
+        time,
+        delta: `${seg(row.qta_delta)} ${row.tipo_consumazione ?? 'consumazione'}`,
+        deltaColor: premium ? TX_COLOR_PREMIUM : TX_COLOR_NORMALE,
+      };
+    }
+    case 'tap':
+      // Tap arena: ticket_delta > 0 ticket guadagnati.
+      return {
+        icon: '✦',
+        iconBg: '#3A2A14',
+        label: 'Tap arena',
+        time,
+        delta: `${seg(row.ticket_delta)} ${plural(row.ticket_delta, 'ticket', 'ticket')}`,
+        deltaColor: TX_COLOR_TICKET,
+      };
+    case 'conversione':
+    default:
+      // Conversione credito → ticket (ticket_delta > 0).
+      return {
+        icon: '🎟',
+        iconBg: '#3A2A14',
+        label: 'Conversione in ticket',
+        time,
+        delta: `${seg(row.ticket_delta)} ${plural(row.ticket_delta, 'ticket', 'ticket')}`,
+        deltaColor: TX_COLOR_TICKET,
+      };
+  }
+}
 
 type View = 'totem' | 'menu' | 'movimenti' | 'tap' | 'esito';
 
@@ -173,6 +243,11 @@ export default function GuestPage() {
   // ── Menù reale (sole voci visibili all'ospite) ────────────────────────────
   const [drinks, setDrinks] = useState<DrinkRow[]>([]);
 
+  // ── Movimenti reali (storico transazioni dell'ospite) ─────────────────────
+  // Caricati SOLO quando la vista MOVIMENTI è aperta (fetch on-demand + polling blando).
+  // La RLS tx_select restituisce solo le righe del chiamante: qui non si somma nulla.
+  const [txRows, setTxRows] = useState<GuestTxRow[]>([]);
+
   // Istanza supabase stabile per i wrapper (in API mode i wrapper non la usano, ma la
   // firma la richiede). useRef così non si ricrea ad ogni render.
   const supabaseRef = useRef<ReturnType<typeof createClient> | null>(null);
@@ -188,6 +263,18 @@ export default function GuestPage() {
       setDrinks(list);
     } catch {
       // Errore transitorio: non azzeriamo il menù noto; ritenta al prossimo giro.
+    }
+  }, []);
+
+  // Refetch dello storico movimenti dell'ospite: SOLA LETTURA via wrapper (branch USE_API
+  // già dentro). La RLS restringe alle sole righe del chiamante; qui non si somma nulla.
+  const refetchTx = useCallback(async (evId: string, signal: () => boolean) => {
+    try {
+      const rows = await getGuestTransactions(supabaseRef.current!, { eventId: evId });
+      if (!signal()) return;
+      setTxRows(rows);
+    } catch {
+      // Errore transitorio: non azzeriamo lo storico noto; ritenta al prossimo giro.
     }
   }, []);
 
@@ -242,6 +329,25 @@ export default function GuestPage() {
       if (menuTimer) clearInterval(menuTimer);
     };
   }, [guestId, refetchMenu]);
+
+  // Effetto: storico MOVIMENTI, caricato SOLO quando la vista movimenti è aperta.
+  // Fetch immediato + polling blando (le transazioni cambiano quando la cassa opera).
+  // Fuori dalla vista movimenti non interroghiamo nulla (risparmio + niente dati stantii).
+  useEffect(() => {
+    if (view !== 'movimenti' || !eventId) return;
+    let active = true;
+    const isActive = () => active;
+
+    void refetchTx(eventId, isActive);
+    const timer = setInterval(() => {
+      void refetchTx(eventId, isActive);
+    }, TX_POLL_MS);
+
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [view, eventId, refetchTx]);
 
   // Effetto: FASE in realtime.
   //   • USE_API: EventSource phase-only sullo stream del guest (evento `phase`).
@@ -625,7 +731,14 @@ export default function GuestPage() {
   }
 
   if (showQR) {
-    return <GuestQR name={nome ?? ''} pin={pin ?? '----'} onBack={() => setShowQR(false)} />;
+    return (
+      <GuestQR
+        name={nome ?? ''}
+        pin={pin ?? '----'}
+        guestId={guestId ?? ''}
+        onBack={() => setShowQR(false)}
+      />
+    );
   }
 
   // ── Estrazione (G10): fase ESTRAZIONE, oppure CHIUSA con estrazione già avvenuta ──
@@ -675,11 +788,14 @@ export default function GuestPage() {
     );
   }
   if (view === 'movimenti') {
+    // Righe REALI dell'ospite (RLS tx_select) → type presentazionale, senza sommare nulla.
+    // Vuoto: GuestMovimenti rende già l'empty-state (nessuna riga = "Ancora nessun movimento").
+    const tx: Tx[] = txRows.map(toTx);
     return (
       <GuestMovimenti
         ticket={dash(ticketTotali)}
         consumazioni={`${saldoNormale ?? 0}N · ${saldoPremium ?? 0}P`}
-        tx={DEMO_TX}
+        tx={tx}
         onBack={() => setView('totem')}
       />
     );

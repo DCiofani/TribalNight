@@ -6,6 +6,15 @@ Tutte le modifiche rilevanti a **Totem Night**. Formato: [Keep a Changelog](http
 
 ## [Unreleased]
 
+### Finalizzazione — rimossi TUTTI i dati mock ✅
+- **2 workflow multi-agente** (audit → fix ∥ → review). L'audit ha trovato 5 mock; tutti risolti con dati reali server-authoritative.
+- **Movimenti ospite (G6)**: rimosso `DEMO_TX` (righe finte) → `GET /api/guest/transactions` + `getGuestTransactions` (RLS `tx_select` = solo le proprie), mapping tipo→icona/label/delta col segno reale dal DB, empty-state. Nessuna somma inventata.
+- **QR ospite (G4)**: rimosso il QR finto decorativo → **encoder QR reale self-contained** (Reed-Solomon GF(256), byte-mode ECC-L, mask-penalty) che codifica il vero `guest.id`; nessuna dipendenza aggiunta.
+- **Grafico regia dashboard**: rimosso il path SVG **finto** ("Consumi per fascia oraria") → `GET /api/regia/consumi-timeline` (aggregazione SQL consumi per ora) + area-chart prop-driven; serie vuota → empty-state "Dati non disponibili".
+- **Prezzi cassa**: rimosso `PREZZO={5,8}` hardcoded → prezzi **reali** dell'evento (`events.prezzo_normale/premium`) via `GET /api/event/current` esteso + `getCurrentEventState`; importo ricarica dal server (mai da costanti). Ricarica disabilitata finché i prezzi non sono caricati.
+- **KPI home cassa**: "Ricariche oggi"/"Incasso" popolati con **totali reali** via `getLedger` (cassa ammessa al ledger: è staff, RLS `is_staff()` già ok); `eventId` risolto su mount così la home carica prezzi/fase/KPI. Fetch fallito → "—" onesto.
+- ✅ tsc pulito; `next build` (api) verde (`/api/guest/transactions`, `/api/regia/consumi-timeline`; /cassa 6.8kB, /guest 13.8kB, /regia 14.2kB). Escluso (non mock): testo T&C bozza, placeholder input UX, palette estetica, hash argon2 dummy (anti-timing).
+
 ### Onboarding — animazione ignite CINEMATICA continua ✅
 - **Workflow multi-agente** (analisi Totem+coreografia → implementazione → review ok). Sostituita la sequenza breve (~2.2s) con una **scena continua ~6.5s**: FASE ignite lento (level 0→6 a 520ms/step, crossfade .6s sovrapposto → fluido) → PICCO in fiamme che pulsa (animazioni interne Totem) → **DECOLOR** (6→1, glow rientra) → **REVEAL** elementi in stagger (anelli tribali che si espandono, pioggia scintille, glifi con overshoot, copy rituale) → **HANDOFF** fluido a /guest (fade overlay + navigate a metà, failsafe). Macchina a fasi (`ignitePhase`), timers puliti su unmount, `prefers-reduced-motion` → versione breve+statica+navigate subito.
 - Totem.tsx NON toccato (pilotato solo via prop `level`). Logica register invariata (registerGuest→saveGuestId→navigate SEMPRE a fine sequenza).

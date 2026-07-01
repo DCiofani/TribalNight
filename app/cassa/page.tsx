@@ -2,7 +2,9 @@
 // LOGICA INVARIATA: login staff → lookup ospite per PIN → topup/consume via RPC,
 // con idempotenza (p_idem) e gating fase. Il front-end NON ricalcola MAI saldi/ticket.
 // Unica differenza UX dal vecchio form: l'importo ricarica è calcolato da quantità ×
-// prezzo fisso (il design non ha campo importo manuale).
+// prezzo dell'evento (il design non ha campo importo manuale). I prezzi NON sono più
+// hardcoded: arrivano dal server (events.prezzo_normale/prezzo_premium via
+// getCurrentEventState). Finché non sono caricati, la ricarica è disabilitata.
 'use client';
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
@@ -11,13 +13,12 @@ import { getCurrentEventId, getCurrentEventState } from '@/lib/events';
 import { useGuestState } from '@/lib/useGuestState';
 import { USE_API } from '@/lib/backend-mode';
 import { staffSignIn, getSessionRole, isStaffRole, signOut } from '@/lib/auth';
-import { lookupGuestByPin, topup, consume, listDrinks, RpcError } from '@/lib/rpc';
+import { lookupGuestByPin, topup, consume, listDrinks, getLedger, RpcError } from '@/lib/rpc';
 import type { TipoConsumazione, DrinkRow } from '@/lib/rpc';
 import { CassaHome, CassaScan, CassaRicarica, CassaConsuma, CassaConferma, type DrinkTile } from '@/components/screens/CassaScreens';
 
-// Prezzi fissi per la ricarica (design C3). Idealmente da config evento.
-const PREZZO: Record<TipoConsumazione, number> = { normale: 5, premium: 8 };
 const fmtEuro = (n: number) => `€ ${n.toFixed(2).replace('.', ',')}`;
+const fmtInt = (n: number) => new Intl.NumberFormat('it-IT').format(n);
 
 function extractConsumeEsito(res: unknown): { tipo: TipoConsumazione | null; ticket: number | null } {
   const row = (Array.isArray(res) ? res[0] : res) as Record<string, unknown> | null;
@@ -53,11 +54,21 @@ export default function CassaPage() {
   const [fase, setFase] = useState<string | null>(null);
   const barChiuso = fase !== null && fase !== 'APERTA';
   const barOperativo = !barChiuso;
+  // Prezzi ricarica dell'evento (autoritativi dal server). null = non ancora caricati →
+  // la ricarica resta disabilitata (non si inventano costanti lato client).
+  const [prezzoNormale, setPrezzoNormale] = useState<number | null>(null);
+  const [prezzoPremium, setPrezzoPremium] = useState<number | null>(null);
+  // KPI home cassa (C1): totali REALI dell'evento via getLedger (la cassa è staff).
+  // null = fetch non riuscito / non ancora disponibile → si mostra "—".
+  const [kpiIncasso, setKpiIncasso] = useState<number | null>(null);
+  const [kpiGettoni, setKpiGettoni] = useState<number | null>(null);
   // Ricarica
   const [tipo, setTipo] = useState<TipoConsumazione>('normale');
   const [qta, setQta] = useState<number>(1);
   const [topupBusy, setTopupBusy] = useState(false);
   const [topupError, setTopupError] = useState<string | null>(null);
+  // Prezzo del tipo selezionato (dal server). null finché non è caricato → ricarica disabilitata.
+  const prezzoCorrente = tipo === 'premium' ? prezzoPremium : prezzoNormale;
   // Consumo
   const [drinks, setDrinks] = useState<DrinkRow[]>([]);
   const [drinkSelezionato, setDrinkSelezionato] = useState<string | null>(null);
@@ -81,6 +92,23 @@ export default function CassaPage() {
   }, [supabase]);
 
   const staff = isStaffRole(role);
+
+  // Risolve l'evento corrente appena lo staff è autenticato: così la HOME (C1) carica
+  // fase, prezzi e KPI (incasso/gettoni) senza attendere il lookup ospite. Il lookup
+  // riconferma comunque lo stesso eventId.
+  useEffect(() => {
+    if (!staff) return;
+    let active = true;
+    void (async () => {
+      try {
+        const id = await getCurrentEventId(supabase);
+        if (active && id) setEventId(id);
+      } catch {
+        /* resta null → prezzi/KPI mostrano "—", ricarica disabilitata */
+      }
+    })();
+    return () => { active = false; };
+  }, [staff, supabase]);
 
   // Listino drink dell'evento (+ realtime SSE su USE_API).
   useEffect(() => {
@@ -109,16 +137,39 @@ export default function CassaPage() {
     return () => { active = false; };
   }, [supabase, eventId]);
 
-  // Fase evento corrente (gating UX).
+  // Fase evento corrente (gating UX) + prezzi ricarica (autoritativi dal server).
+  // Un solo getCurrentEventState fornisce fase e prezzi coerenti per lo stesso evento.
   useEffect(() => {
-    if (!eventId) { setFase(null); return; }
+    if (!eventId) { setFase(null); setPrezzoNormale(null); setPrezzoPremium(null); return; }
     let active = true;
     void (async () => {
       try {
         const st = await getCurrentEventState(supabase);
-        if (active) setFase(st?.fase ?? null);
+        if (!active) return;
+        setFase(st?.fase ?? null);
+        setPrezzoNormale(st?.prezzo_normale ?? null);
+        setPrezzoPremium(st?.prezzo_premium ?? null);
       } catch {
-        if (active) setFase(null);
+        if (active) { setFase(null); setPrezzoNormale(null); setPrezzoPremium(null); }
+      }
+    })();
+    return () => { active = false; };
+  }, [supabase, eventId]);
+
+  // KPI home cassa (C1): totali REALI dell'evento via getLedger (la cassa è staff → RLS ok).
+  // Non ricalcoliamo nulla nel client: incasso_euro e gettoni_emessi sono aggregati dal DB.
+  // Se il fetch fallisce lasciamo null → la UI mostra "—".
+  useEffect(() => {
+    if (!eventId) { setKpiIncasso(null); setKpiGettoni(null); return; }
+    let active = true;
+    void (async () => {
+      try {
+        const ledger = await getLedger(supabase, { eventId });
+        if (!active) return;
+        setKpiIncasso(ledger.totali.incasso_euro);
+        setKpiGettoni(ledger.totali.gettoni_emessi);
+      } catch {
+        if (active) { setKpiIncasso(null); setKpiGettoni(null); }
       }
     })();
     return () => { active = false; };
@@ -194,8 +245,10 @@ export default function CassaPage() {
   async function handleTopup() {
     if (!guestId) return;
     if (!Number.isFinite(qta) || qta < 1) { setTopupError('Quantità minima 1'); return; }
-    // Importo = quantità × prezzo fisso del tipo (design C3, niente importo manuale).
-    const importo = qta * PREZZO[tipo];
+    // Prezzo autoritativo dal server: se non è ancora caricato non inventiamo nulla, si attende.
+    if (prezzoCorrente == null) { setTopupError('Prezzi non disponibili'); return; }
+    // Importo = quantità × prezzo dell'evento (design C3, niente importo manuale).
+    const importo = qta * prezzoCorrente;
     setTopupBusy(true);
     setTopupError(null);
     if (!idemRef.current) idemRef.current = crypto.randomUUID();
@@ -276,8 +329,8 @@ export default function CassaPage() {
       <CassaHome
         staffName={(role ?? 'STAFF').toUpperCase()}
         stato={fase ?? 'APERTA'}
-        ricaricheOggi="—"
-        incasso="—"
+        ricaricheOggi={kpiGettoni == null ? '—' : fmtInt(kpiGettoni)}
+        incasso={kpiIncasso == null ? '—' : fmtEuro(kpiIncasso)}
         onRicarica={() => setMode('ricarica')}
         onConsuma={() => setMode('consuma')}
         onLogout={handleEsci}
@@ -326,14 +379,14 @@ export default function CassaPage() {
         guestName={guest.nome ?? guestNome ?? ''}
         guestSub={guestSub}
         tipo={tipo === 'normale' ? 'NORMALE' : 'PREMIUM'}
-        prezzoN={fmtEuro(PREZZO.normale)}
-        prezzoP={fmtEuro(PREZZO.premium)}
+        prezzoN={prezzoNormale == null ? '—' : fmtEuro(prezzoNormale)}
+        prezzoP={prezzoPremium == null ? '—' : fmtEuro(prezzoPremium)}
         qty={qta}
-        totale={fmtEuro(qta * PREZZO[tipo])}
+        totale={prezzoCorrente == null ? '—' : fmtEuro(qta * prezzoCorrente)}
         onTipo={(t) => { idemRef.current = null; setTipo(t === 'NORMALE' ? 'normale' : 'premium'); }}
         onDec={() => { idemRef.current = null; setQta((q) => Math.max(1, q - 1)); }}
         onInc={() => { idemRef.current = null; setQta((q) => q + 1); }}
-        onConfirm={() => { if (barOperativo && !topupBusy) void handleTopup(); }}
+        onConfirm={() => { if (barOperativo && !topupBusy && prezzoCorrente != null) void handleTopup(); }}
         onBack={resetGuest}
         />
       </>
