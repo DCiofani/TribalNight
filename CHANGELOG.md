@@ -6,6 +6,12 @@ Tutte le modifiche rilevanti a **Totem Night**. Formato: [Keep a Changelog](http
 
 ## [Unreleased]
 
+### Routing dominio — ingresso cliente `/` + chooser staff `/gestore` ✅
+- **Workflow multi-agente** (build → review hull `code-reviewer`, verdict ok). Prepara la struttura `dominio.com/x`: sezione cliente e sezione gestore separate per path.
+- **`/` = ingresso CLIENTE**: splash 'use client' (kicker + wordmark + Totem acceso + tagline + loader) che su mount **smista SEMPRE**: `loadGuestId()` → `router.replace('/guest')` se sessione presente, altrimenti `/onboarding`. localStorage letto solo lato client (dentro `useEffect`): render SSR = primo render client (splash puro) → nessun mismatch d'idratazione. Failsafe `setTimeout(900ms)` + guard `routedRef` → redirect garantito, niente doppio-navigate né deadlock. `replace` (non push) → splash fuori dalla history.
+- **`/gestore` = chooser STAFF** (nuovo): landing sobria on-brand (palette calda, font display/ritual) — titolo GESTORE, kicker "Pannello staff", due tile grandi **CASSA** (→ /cassa, gradiente ember) e **REGIA** (→ /regia, gradiente indigo, hex allineati a `Button.tsx`), nota "Accesso riservato allo staff". Nessun login nella landing. Non toccati /onboarding, /guest, /cassa, /regia.
+- ✅ tsc pulito (0 TS2688); `next build` (api) verde (`/` 1.13kB, `/gestore` 1.02kB). **E2E preview**: `/` senza sessione → `/onboarding` (verificato `location.pathname`); `/gestore` → tile CASSA+REGIA rese e linkate.
+
 ### Finalizzazione — rimossi TUTTI i dati mock ✅
 - **2 workflow multi-agente** (audit → fix ∥ → review). L'audit ha trovato 5 mock; tutti risolti con dati reali server-authoritative.
 - **Movimenti ospite (G6)**: rimosso `DEMO_TX` (righe finte) → `GET /api/guest/transactions` + `getGuestTransactions` (RLS `tx_select` = solo le proprie), mapping tipo→icona/label/delta col segno reale dal DB, empty-state. Nessuna somma inventata.
