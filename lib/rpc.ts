@@ -448,3 +448,35 @@ export async function getEventStats(
   if (!row) throw new RpcError('event_stats non ha restituito statistiche');
   return row as EventStats;
 }
+
+// Esito estrazione dell'OSPITE chiamante (reveal G10). Sola lettura, guest-safe:
+// la RLS su public.draws è STAFF-ONLY, quindi l'ospite non legge `draws` da sé — l'esito
+// arriva dalla RPC SECURITY DEFINER my_draw_result (0008), che ritorna SOLO l'esito del
+// chiamante (risolto via auth.uid()) senza mai esporre i dati di altri ospiti. Il front-end
+// NON calcola mai estratto/vinto: tutto dal server.
+//   estratto — il sorteggio è avvenuto (esiste una draws per l'evento)
+//   vinto    — il chiamante è tra i vincitori (winners[*].guest_id)
+//   premio   — etichetta posizione se vinto (es. "1° posto"), altrimenti null
+//
+// Branch USE_API:
+//   - API: GET /api/guest/draw-result?event=<id> → { estratto, vinto, premio } (gate
+//     requireAuth server-side, ospite incluso).
+//   - supabase (path RPC): rpc my_draw_result(p_event) → prima (unica) riga.
+export type DrawResult = { estratto: boolean; vinto: boolean; premio: string | null };
+
+export async function getMyDrawResult(
+  supabase: SupabaseClient,
+  args: { eventId: string },
+): Promise<DrawResult> {
+  if (USE_API) {
+    return apiGet<DrawResult>(
+      `/api/guest/draw-result?event=${encodeURIComponent(args.eventId)}`,
+    );
+  }
+
+  const { data, error } = await supabase.rpc('my_draw_result', { p_event: args.eventId });
+  if (error) rethrow(error);
+  const row = Array.isArray(data) ? data[0] : data;
+  // La RPC ritorna sempre una riga; il fallback difende da un result set vuoto imprevisto.
+  return (row as DrawResult | null) ?? { estratto: false, vinto: false, premio: null };
+}

@@ -14,7 +14,15 @@ import { useRouter } from 'next/navigation';
 import { loadGuestId } from '@/lib/guest-session';
 import { useGuestState } from '@/lib/useGuestState';
 import { createClient } from '@/lib/supabase/client';
-import { listVisibleDrinks, getActiveSession, registerTaps, type DrinkRow } from '@/lib/rpc';
+import {
+  listVisibleDrinks,
+  getActiveSession,
+  registerTaps,
+  convertCredit,
+  getMyDrawResult,
+  RpcError,
+  type DrinkRow,
+} from '@/lib/rpc';
 import { getCurrentEventState } from '@/lib/events';
 import { USE_API } from '@/lib/backend-mode';
 import GuestHome from '@/components/screens/GuestHome';
@@ -23,6 +31,8 @@ import GuestMovimenti, { type Tx } from '@/components/screens/GuestMovimenti';
 import GuestQR from '@/components/screens/GuestQR';
 import TapArena from '@/components/screens/TapArena';
 import EsitoTap from '@/components/screens/EsitoTap';
+import Conversione from '@/components/screens/Conversione';
+import Reveal from '@/components/screens/Reveal';
 
 // Seed deterministico dall'id ospite → totem stabile per-ospite (SSR-safe).
 function seedFromId(id: string): number {
@@ -60,6 +70,30 @@ const TAP_FLUSH_MS = 1000;
 // e i ticket vengano assegnati (delta su ticket_totali via useGuestState). Oltre questo
 // mostriamo comunque l'esito con i ticket noti (0 = "nessun ticket stavolta").
 const CLOSE_WAIT_MS = 20000;
+
+// ── Estrazione (G10) ───────────────────────────────────────────────────────
+// Poll dell'esito estrazione (my_draw_result, guest-safe SECURITY DEFINER) mentre la
+// fase è ESTRAZIONE/CHIUSA: si interroga finché estratto===true, poi si mostra win/lose.
+// L'esito è SEMPRE autoritativo dal server: qui non si calcola nulla.
+const DRAW_POLL_MS = 2500;
+
+// idem STABILE per convert_credit: persistito per-ospite così un refresh a metà
+// conversione NON ri-converte (la RPC è comunque idempotente su p_idem lato DB). Non
+// tocca i saldi/ticket: è solo la chiave di deduplicazione della singola operazione.
+const CONVERT_IDEM_KEY = 'tn_convert_idem';
+function stableConvertIdem(guestId: string): string {
+  const key = `${CONVERT_IDEM_KEY}:${guestId}`;
+  try {
+    const existing = localStorage.getItem(key);
+    if (existing) return existing;
+    const id = crypto.randomUUID();
+    localStorage.setItem(key, id);
+    return id;
+  } catch {
+    // storage non disponibile: idem effimero (retry entro la stessa sessione via ref chiamante).
+    return crypto.randomUUID();
+  }
+}
 
 // Tag presentazionali (colori del mockup DEMO). NB: il tag indica il TIPO di
 // consumazione richiesto, NON un prezzo (il front-end non calcola nulla). Oggi tutte
@@ -279,6 +313,24 @@ export default function GuestPage() {
   const [esitoTicket, setEsitoTicket] = useState(0);
   const [esitoTap, setEsitoTap] = useState(0);
 
+  // ── Conversione (G9) ───────────────────────────────────────────────────────
+  // busy/error della singola operazione convert_credit; `converted` per il post-stato
+  // "Convertito ✓". I saldi tornano a 0 via useGuestState (server-authoritative): qui
+  // NON li tocchiamo a mano.
+  const [convertBusy, setConvertBusy] = useState(false);
+  const [convertError, setConvertError] = useState<string | null>(null);
+  const [converted, setConverted] = useState(false);
+  // "Non ora": l'ospite può posticipare e navigare l'hub; resta in LAST_CALL finché la
+  // fase non cambia. Non è una decisione autoritativa, solo una preferenza UX locale.
+  const [convertDismissed, setConvertDismissed] = useState(false);
+
+  // ── Estrazione (G10) ───────────────────────────────────────────────────────
+  // Esito del sorteggio, autoritativo dal server (my_draw_result). null = non ancora noto
+  // (fase ESTRAZIONE → stato 'attesa'). Quando estratto===true si passa a win/lose.
+  const [drawEstratto, setDrawEstratto] = useState(false);
+  const [drawVinto, setDrawVinto] = useState(false);
+  const [drawPremio, setDrawPremio] = useState<string | null>(null);
+
   // Snapshot ticket PRIMA di entrare in arena (per il delta) + ref al ticket LIVE, così
   // gli effetti leggono l'ultimo valore senza ri-sottoscriversi ad ogni cambio.
   const ticketPrimaRef = useRef<number | null>(null);
@@ -440,6 +492,64 @@ export default function GuestPage() {
     };
   }, [view, esitoPending, ticketTotali]);
 
+  // ── Conversione (G9): convert_credit con idem STABILE ─────────────────────
+  // Il DB verifica fase (LAST_CALL) e permesso (self-or-staff) + è idempotente su p_idem.
+  // Dopo il successo: mostriamo "Convertito ✓" (i saldi→0 arrivano da useGuestState).
+  const handleConverti = useCallback(async () => {
+    if (!guestId || convertBusy) return;
+    setConvertBusy(true);
+    setConvertError(null);
+    try {
+      await convertCredit(supabaseRef.current!, {
+        guestId,
+        idem: stableConvertIdem(guestId),
+      });
+      setConverted(true);
+    } catch (err) {
+      const msg =
+        err instanceof RpcError
+          ? err.message
+          : 'Conversione non riuscita. Riprova tra un istante.';
+      setConvertError(msg);
+    } finally {
+      setConvertBusy(false);
+    }
+  }, [guestId, convertBusy]);
+
+  // ── Estrazione (G10): poll dell'esito guest-safe finché estratto===true ────
+  // Attivo in fase ESTRAZIONE e CHIUSA (se l'estrazione è già avvenuta l'esito è finale).
+  // my_draw_result NON espone dati di altri ospiti: ritorna SOLO l'esito del chiamante.
+  useEffect(() => {
+    if (!guestId || !eventId) return;
+    if (fase !== 'ESTRAZIONE' && fase !== 'CHIUSA') return;
+    if (drawEstratto) return; // esito già rivelato: niente altro polling
+
+    let active = true;
+    const isActive = () => active;
+    let timer: ReturnType<typeof setInterval> | null = null;
+
+    const check = async () => {
+      try {
+        const res = await getMyDrawResult(supabaseRef.current!, { eventId });
+        if (!isActive()) return;
+        if (res.estratto) {
+          setDrawVinto(res.vinto);
+          setDrawPremio(res.premio);
+          setDrawEstratto(true); // → l'effetto si smonta (dep drawEstratto)
+        }
+      } catch {
+        // errore transitorio: resta in 'attesa', ritenta al prossimo giro.
+      }
+    };
+
+    void check();
+    timer = setInterval(() => void check(), DRAW_POLL_MS);
+    return () => {
+      active = false;
+      if (timer) clearInterval(timer);
+    };
+  }, [guestId, eventId, fase, drawEstratto]);
+
   const seed = guestId ? seedFromId(guestId) : 7;
   const dash = (v: number | null) => (v == null ? '—' : v);
 
@@ -478,6 +588,44 @@ export default function GuestPage() {
 
   if (showQR) {
     return <GuestQR name={nome ?? ''} pin={pin ?? '----'} onBack={() => setShowQR(false)} />;
+  }
+
+  // ── Estrazione (G10): fase ESTRAZIONE, oppure CHIUSA con estrazione già avvenuta ──
+  // Vista immersiva (attesa → win/lose). L'esito è SERVER-authoritative (my_draw_result):
+  //   • estratto=false → 'attesa' (totem pulsa, "estrazione in corso").
+  //   • estratto=true  → 'win' se vinto, altrimenti 'lose'.
+  // In CHIUSA la mostriamo SOLO se l'estrazione è già avvenuta (drawEstratto): se in CHIUSA
+  // non c'è alcun sorteggio, cadiamo sull'hub (stato finale col banner PHASE_NOTICE).
+  const revealTicket = ticketTotali ?? 0;
+  if (fase === 'ESTRAZIONE' || (fase === 'CHIUSA' && drawEstratto)) {
+    return (
+      <Reveal
+        stato={drawEstratto ? (drawVinto ? 'win' : 'lose') : 'attesa'}
+        ticket={revealTicket}
+        premio={drawPremio}
+      />
+    );
+  }
+
+  // ── Conversione (G9): fase LAST_CALL con credito residuo (>0) ──────────────
+  // Vista full-screen (G9 + modale G9b). Saldi/anteprima dal server; l'esito post-conversione
+  // ("Convertito ✓") e i saldi→0 sono server-authoritative (useGuestState). "Non ora" posticipa
+  // (convertDismissed) lasciando navigare l'hub; l'ospite può tornarci finché resta LAST_CALL.
+  const saldoResiduo = (saldoNormale ?? 0) + (saldoPremium ?? 0);
+  if (fase === 'LAST_CALL' && (converted || (saldoResiduo > 0 && !convertDismissed))) {
+    return (
+      <Conversione
+        saldoNormale={saldoNormale ?? 0}
+        saldoPremium={saldoPremium ?? 0}
+        anteprimaTicket={null}
+        busy={convertBusy}
+        error={convertError}
+        done={converted}
+        onConferma={handleConverti}
+        onAnnulla={() => setConvertDismissed(true)}
+        seed={seed}
+      />
+    );
   }
   if (view === 'menu') {
     return (

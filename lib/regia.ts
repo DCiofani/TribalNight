@@ -91,6 +91,53 @@ export async function runDraw(
   return data;
 }
 
+// Una riga della classifica finale dell'estrazione, come la serializza run_draw nel
+// campo draws.winners: [{ pos, guest_id, nome, tickets }, ...] ordinata per pos. Il
+// client la legge e basta — non ricalcola nulla, l'esito è autoritativo lato DB.
+export type DrawWinner = {
+  pos: number;
+  guest_id: string;
+  nome: string;
+  tickets: number;
+};
+
+// L'ultima estrazione registrata per l'evento, o null se non è ancora avvenuta.
+export type LastDraw = {
+  winners: DrawWinner[];
+  seed: number | null;
+  n_winners: number;
+  created_at: string;
+};
+
+// getLastDraw(...) -> ultima estrazione registrata per l'evento (o null se assente).
+// Sola lettura, NIENTE ricalcolo: winners è già la classifica finale prodotta da run_draw
+// (append-only, si legge la più recente per created_at). Alimenta il pannello R6.
+//
+// Branch USE_API:
+//   - API: GET /api/regia/draw?event=<id> → LastDraw | null (gate regia/admin server-side).
+//   - supabase (INVARIATO): select su draws filtrata event_id, ordinata created_at desc,
+//     limit 1 → maybeSingle() (0 righe → null, la RLS draws_select richiede is_staff()).
+export async function getLastDraw(
+  supabase: SupabaseClient,
+  args: { eventId: string },
+): Promise<LastDraw | null> {
+  if (USE_API) {
+    return apiGet<LastDraw | null>(
+      `/api/regia/draw?event=${encodeURIComponent(args.eventId)}`,
+    );
+  }
+
+  const { data, error } = await supabase
+    .from('draws')
+    .select('winners, seed, n_winners, created_at')
+    .eq('event_id', args.eventId)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) rethrow(error);
+  return (data as LastDraw | null) ?? null;
+}
+
 // updateEventSettings(...) -> aggiorna i parametri economici/di gioco dell'evento.
 // Tutti e 9 i campi sono OPZIONALI: quelli omessi (→ null) significano "non toccare",
 // il DB fa coalesce sul valore esistente. Mappa camelCase → snake_case, ogni campo `?? null`.

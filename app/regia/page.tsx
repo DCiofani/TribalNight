@@ -54,8 +54,10 @@ import {
   setDrinkVisibility,
   setDrinkActive,
   getLeaderboard,
+  getLastDraw,
   type Phase,
   type LeaderboardRow,
+  type LastDraw,
 } from '@/lib/regia';
 
 // Fasi del flusso serata (spec §10). Ordine/labels per timeline e controlli; la fase
@@ -280,8 +282,14 @@ export default function RegiaPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
 
-  // ── Estrazione (esito ultimo run) ───────────────────────────────────────
-  const [drawResult, setDrawResult] = useState<string | null>(null);
+  // ── Estrazione (R6) ─────────────────────────────────────────────────────
+  // nWinners: numero vincitori da estrarre (stepper, default 3). SOLO input UI.
+  // lastDraw: ultima estrazione REGISTRATA lato server (getLastDraw) → alimenta il
+  //   reveal stage (R6b). I vincitori NON sono mai inventati dal client: vengono da qui.
+  const [nWinners, setNWinners] = useState(3);
+  const [lastDraw, setLastDraw] = useState<LastDraw | null>(null);
+  const [lastDrawChecked, setLastDrawChecked] = useState(false);
+  const [lastDrawError, setLastDrawError] = useState<string | null>(null);
 
   // ── Sessioni tap (R3) — stato LIVE/IDLE, tutto SOLA LETTURA dal server ───
   // activeSession: finestra della sessione attiva (getActiveSession) o null (IDLE).
@@ -390,6 +398,23 @@ export default function RegiaPage() {
       setSessionError(null);
     } catch (err) {
       setSessionError(err instanceof Error ? err.message : 'Classifica non disponibile');
+    }
+  }
+
+  // Fetch SOLA LETTURA dell'ultima estrazione registrata (R6): winners/seed/n_winners.
+  // NIENTE ricalcolo: `winners` è già la classifica finale prodotta da run_draw; qui la
+  // si legge e basta per popolare il reveal stage. null → nessuna estrazione ancora fatta.
+  async function refetchLastDraw() {
+    const id = eventIdRef.current;
+    if (!id) return;
+    try {
+      const d = await getLastDraw(supabase, { eventId: id });
+      setLastDraw(d);
+      setLastDrawError(null);
+    } catch (err) {
+      setLastDrawError(err instanceof Error ? err.message : 'Estrazione non disponibile');
+    } finally {
+      setLastDrawChecked(true);
     }
   }
 
@@ -556,6 +581,22 @@ export default function RegiaPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [staff, eventId, tab]);
 
+  // ── Estrazione (R6): al primo ingresso nel tab legge l'ultima estrazione ──
+  // registrata (se già avvenuta → mostra il reveal). SOLA LETTURA, nessun polling:
+  // l'estrazione è un evento raro/manuale, si rilegge solo entrando nel tab e dopo runDraw.
+  useEffect(() => {
+    if (!staff || !eventId || tab !== 'estrazione') return;
+    let active = true;
+    void (async () => {
+      if (!active) return;
+      await refetchLastDraw();
+    })();
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [staff, eventId, tab]);
+
   // Countdown UX locale: scala secondsLeft ogni secondo tra un poll e l'altro (il valore
   // autoritativo resta la scadenza dal server, ri-sincronizzata ad ogni refetchActiveSession).
   useEffect(() => {
@@ -599,7 +640,10 @@ export default function RegiaPage() {
     setStatsError(null);
     setActionError(null);
     setFeedback(null);
-    setDrawResult(null);
+    setNWinners(3);
+    setLastDraw(null);
+    setLastDrawChecked(false);
+    setLastDrawError(null);
     setActiveSession(null);
     setSessionChecked(false);
     setSessionError(null);
@@ -679,7 +723,8 @@ export default function RegiaPage() {
   }
 
   function handleDraw() {
-    setDrawResult(null);
+    // Clamp difensivo del numero vincitori (min 1): il server è comunque autoritativo.
+    const n = Math.max(1, Math.trunc(nWinners) || 1);
     void runAction(
       'draw',
       async () => {
@@ -687,11 +732,10 @@ export default function RegiaPage() {
         if (stats && stats.fase !== 'ESTRAZIONE') {
           await setPhase(supabase, { eventId: eventId as string, phase: 'ESTRAZIONE' });
         }
-        const res = await runDraw(supabase, { eventId: eventId as string, nWinners: 3 });
-        // Esito solo presentazionale: il server è autoritativo, qui non sorteggiamo.
-        setDrawResult(
-          typeof res === 'string' ? res : 'Estrazione completata — 3 vincitori',
-        );
+        const res = await runDraw(supabase, { eventId: eventId as string, nWinners: n });
+        // Reveal stage (R6b): i vincitori arrivano dal server via getLastDraw, MAI dal client.
+        // Rileggiamo subito l'estrazione appena registrata senza attendere un refetch di tab.
+        await refetchLastDraw();
         return res;
       },
       'Estrazione eseguita',
@@ -1412,41 +1456,226 @@ export default function RegiaPage() {
           </div>
         )}
 
-        {/* ── R6 — Estrazione ───────────────────────────────────────────── */}
+        {/* ── R6 — Estrazione (draw panel) + R6b reveal stage ───────────── */}
         {tab === 'estrazione' && (
-          <div style={panel}>
-            <div style={{ fontFamily: 'var(--font-ritual)', letterSpacing: '.16em', fontSize: 11, color: C.inkMuted, marginBottom: 10 }}>
-              SORTEGGIO
-            </div>
-            <p style={{ margin: '0 0 8px', color: C.inkSoft, fontSize: 14 }}>
-              Biglietti in gioco: <b style={{ color: C.gold }}>{stats?.ticket_totali ?? '—'}</b> ·
-              Presenze: <b style={{ color: '#fff' }}>{stats?.presenze ?? '—'}</b>
-            </p>
-            <p style={{ margin: '0 0 16px', color: C.inkMuted, fontSize: 13 }}>
-              Estrazione pesata sui ticket, eseguita dal server. Se l&apos;evento non è già in fase
-              ESTRAZIONE ci viene portato prima del sorteggio.
-            </p>
-            <DButton variant="gold" disabled={!eventId || busyAction !== null} onClick={handleDraw}>
-              {busyAction === 'draw' ? 'Estrazione…' : 'Estrai ora (3 vincitori)'}
-            </DButton>
-            {actionError && <Note kind="err">{actionError}</Note>}
-            {feedback && <Note kind="ok">{feedback}</Note>}
-            {drawResult && (
-              <div
+          <>
+            {/* R6 · Pannello sorteggio: stats presentazionali + stepper + ESTRAI ORA. */}
+            <div
+              style={{
+                ...panel,
+                maxWidth: 620,
+                margin: '0 auto',
+                width: '100%',
+                textAlign: 'center',
+                padding: 40,
+                boxShadow: '0 0 60px rgba(242,180,60,.08)',
+              }}
+            >
+              {/* Biglietti in gioco / partecipanti — DATI dal server (stats), mai calcolati. */}
+              <div style={{ display: 'flex', justifyContent: 'center', gap: 40 }}>
+                <div>
+                  <div style={{ fontFamily: 'var(--font-display)', fontSize: 40, color: C.gold }}>
+                    {stats?.ticket_totali ?? '—'}
+                  </div>
+                  <div style={{ fontFamily: 'var(--font-ritual)', letterSpacing: '.14em', fontSize: 11, color: C.inkMuted }}>
+                    BIGLIETTI IN GIOCO
+                  </div>
+                </div>
+                <div>
+                  <div style={{ fontFamily: 'var(--font-display)', fontSize: 40 }}>
+                    {stats?.presenze ?? '—'}
+                  </div>
+                  <div style={{ fontFamily: 'var(--font-ritual)', letterSpacing: '.14em', fontSize: 11, color: C.inkMuted }}>
+                    PARTECIPANTI
+                  </div>
+                </div>
+              </div>
+
+              {/* Stepper numero vincitori (default 3). Solo input UI: il server è autoritativo. */}
+              <div style={{ marginTop: 36, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 24 }}>
+                <div style={{ fontSize: 15, color: C.inkSoft }}>Numero vincitori</div>
+                <div role="group" aria-label="Numero vincitori" style={{ display: 'flex', alignItems: 'center', gap: 18 }}>
+                  <button
+                    type="button"
+                    aria-label="Diminuisci"
+                    disabled={busyAction !== null || nWinners <= 1}
+                    onClick={() => setNWinners((n) => Math.max(1, n - 1))}
+                    style={{
+                      width: 48,
+                      height: 48,
+                      borderRadius: 12,
+                      border: `1px solid ${C.border}`,
+                      background: 'transparent',
+                      color: C.inkSoft,
+                      fontSize: 26,
+                      lineHeight: 1,
+                      cursor: busyAction !== null || nWinners <= 1 ? 'not-allowed' : 'pointer',
+                      opacity: busyAction !== null || nWinners <= 1 ? 0.5 : 1,
+                    }}
+                  >
+                    −
+                  </button>
+                  <div
+                    aria-live="polite"
+                    style={{ fontFamily: 'var(--font-display)', fontSize: 44, width: 60, textAlign: 'center' }}
+                  >
+                    {nWinners}
+                  </div>
+                  <button
+                    type="button"
+                    aria-label="Aumenta"
+                    disabled={busyAction !== null}
+                    onClick={() => setNWinners((n) => n + 1)}
+                    style={{
+                      width: 48,
+                      height: 48,
+                      borderRadius: 12,
+                      border: '1px solid transparent',
+                      background: C.blue,
+                      color: '#fff',
+                      fontSize: 26,
+                      lineHeight: 1,
+                      cursor: busyAction !== null ? 'not-allowed' : 'pointer',
+                      opacity: busyAction !== null ? 0.5 : 1,
+                    }}
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
+
+              {/* Primary oro grande "ESTRAI ORA" → runDraw(nWinners). */}
+              <button
+                type="button"
+                disabled={!eventId || busyAction !== null}
+                onClick={handleDraw}
                 style={{
-                  marginTop: 16,
-                  padding: 16,
-                  borderRadius: 12,
-                  border: `1px solid ${C.gold}`,
-                  background: 'rgba(216,154,62,.08)',
-                  color: C.goldSoft,
-                  fontSize: 14,
+                  marginTop: 36,
+                  width: '100%',
+                  height: 64,
+                  borderRadius: 14,
+                  border: 'none',
+                  background: `linear-gradient(90deg, ${C.gold}, ${EMBER})`,
+                  color: '#1A0F08',
+                  fontFamily: 'var(--font-display)',
+                  fontSize: 24,
+                  letterSpacing: '.06em',
+                  boxShadow: '0 0 36px rgba(242,180,60,.4)',
+                  cursor: !eventId || busyAction !== null ? 'not-allowed' : 'pointer',
+                  opacity: !eventId || busyAction !== null ? 0.6 : 1,
                 }}
               >
-                {drawResult}
+                {busyAction === 'draw' ? 'ESTRAZIONE…' : 'ESTRAI ORA'}
+              </button>
+
+              <div style={{ marginTop: 16, color: C.inkMuted, fontSize: 13 }}>
+                Sorteggio pesato sui ticket. Seed e lista salvati per verifica.
+              </div>
+
+              {actionError && <Note kind="err">{actionError}</Note>}
+              {feedback && <Note kind="ok">{feedback}</Note>}
+            </div>
+
+            {/* R6b · Reveal stage: podio vincitori DAL SERVER (getLastDraw), mai inventati. */}
+            {eventId && lastDrawChecked && !lastDraw && !lastDrawError && (
+              <div style={{ ...panel, color: C.inkMuted, fontSize: 14, textAlign: 'center', maxWidth: 620, margin: '0 auto', width: '100%' }}>
+                Nessuna estrazione ancora eseguita. Il reveal comparirà qui dopo il sorteggio.
               </div>
             )}
-          </div>
+            {lastDrawError && (
+              <div style={{ maxWidth: 620, margin: '0 auto', width: '100%' }}>
+                <Note kind="err">Estrazione non disponibile: {lastDrawError}</Note>
+              </div>
+            )}
+
+            {eventId && lastDraw && lastDraw.winners.length > 0 && (
+              <div
+                style={{
+                  position: 'relative',
+                  borderRadius: 20,
+                  border: `1px solid ${C.border}`,
+                  overflow: 'hidden',
+                  background: 'radial-gradient(60% 60% at 50% 30%, rgba(242,180,60,.22) 0%, transparent 62%), #190F08',
+                  padding: '48px 32px 40px',
+                  textAlign: 'center',
+                }}
+              >
+                <div style={{ fontFamily: 'var(--font-ritual)', letterSpacing: '.34em', fontSize: 16, color: C.inkSoft }}>
+                  {lastDraw.winners.length > 1 ? 'I VINCITORI SONO' : 'IL VINCITORE È'}
+                </div>
+
+                {/* Vincitore principale (pos 1) in grande; eventuali altri nel podio sotto. */}
+                {(() => {
+                  const sorted = [...lastDraw.winners].sort((a, b) => a.pos - b.pos);
+                  const [first, ...rest] = sorted;
+                  return (
+                    <>
+                      <div
+                        style={{
+                          fontFamily: 'var(--font-display)',
+                          fontSize: 72,
+                          color: C.gold,
+                          lineHeight: 0.95,
+                          marginTop: 10,
+                          textShadow: '0 0 60px rgba(242,180,60,.6)',
+                          wordBreak: 'break-word',
+                        }}
+                      >
+                        {first?.nome || '—'}
+                      </div>
+                      <div style={{ fontFamily: 'var(--font-ritual)', letterSpacing: '.2em', fontSize: 16, color: '#fff', marginTop: 14 }}>
+                        {(first?.tickets ?? 0)} TICKET · {first?.pos ?? 1}° POSTO
+                      </div>
+
+                      {rest.length > 0 && (
+                        <ul
+                          aria-label="Altri vincitori"
+                          style={{
+                            listStyle: 'none',
+                            margin: '30px auto 0',
+                            padding: 0,
+                            display: 'flex',
+                            flexWrap: 'wrap',
+                            justifyContent: 'center',
+                            gap: 14,
+                            maxWidth: 720,
+                          }}
+                        >
+                          {rest.map((w) => (
+                            <li
+                              key={w.guest_id}
+                              style={{
+                                minWidth: 150,
+                                background: C.surface,
+                                border: `1px solid ${C.border}`,
+                                borderRadius: 14,
+                                padding: '14px 18px',
+                              }}
+                            >
+                              <div style={{ fontFamily: 'var(--font-display)', fontSize: 22, color: rankColor(w.pos) }}>
+                                {w.pos}°
+                              </div>
+                              <div style={{ fontWeight: 700, fontSize: 15, color: '#fff', marginTop: 2, wordBreak: 'break-word' }}>
+                                {w.nome || '—'}
+                              </div>
+                              <div style={{ fontSize: 12.5, color: C.inkMuted, marginTop: 2 }}>
+                                {w.tickets} ticket
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </>
+                  );
+                })()}
+
+                {/* Meta estrazione: seed + n. vincitori (verifica), dalla stessa riga draws. */}
+                <div style={{ marginTop: 30, color: C.inkMuted, fontSize: 12.5, fontFamily: 'var(--font-ui)' }}>
+                  {lastDraw.n_winners} vincitori · seed {lastDraw.seed ?? '—'} · {new Date(lastDraw.created_at).toLocaleString('it-IT')}
+                </div>
+              </div>
+            )}
+          </>
         )}
 
         {/* ── R7 — Ledger (placeholder) ─────────────────────────────────── */}

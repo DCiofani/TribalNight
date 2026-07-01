@@ -6,6 +6,14 @@ Tutte le modifiche rilevanti a **Totem Night**. Formato: [Keep a Changelog](http
 
 ## [Unreleased]
 
+### M4 — finale: conversione G9 + estrazione/reveal G10 + regia R6 ✅ (flussi gioco G7-G10 COMPLETI)
+- **Workflow multi-agente** (enabler ∥ → UI ∥ → review, file-disgiunti). Review verdict **ok**.
+- **Gap risolto — reveal guest-safe**: `draws` è staff-only (RLS 0002) → nuova RPC **`my_draw_result(p_event)`** (`0008`, SECURITY DEFINER, grant authenticated) che ritorna SOLO l'esito del chiamante `{estratto, vinto, premio}` (scansiona `draws.winners` jsonb `{pos,guest_id,nome,tickets}` cercando il proprio `guest_id`; mai dati di altri) + `GET /api/guest/draw-result` + `getMyDrawResult` (lib/rpc.ts). `GET /api/regia/draw` (staff, ultima draw) + `getLastDraw`/`LastDraw`/`DrawWinner` (lib/regia.ts).
+- **Guest G9 conversione** (`components/screens/Conversione.tsx`): badge LAST CALL, riepilogo residuo, **modale G9b "IRREVERSIBILE"**, `convertCredit` con **idem stabile persistito in localStorage** (anti-doppia-conversione su refresh); saldi→0 via `useGuestState`. **G10 reveal** (`Reveal.tsx`): attesa/win/lose. `app/guest/page.tsx` fase-driven: LAST_CALL+saldo>0 → conversione; ESTRAZIONE → reveal (poll `getMyDrawResult` ~2.5s finché estratto → win/lose). Esito MAI calcolato dal client.
+- **Regia R6** (`app/regia/page.tsx` tab estrazione): pannello (biglietti in gioco, stepper vincitori, ESTRAI ORA→`runDraw`) + **reveal stage** (podio vincitori da `getLastDraw`).
+- ✅ **Verifica reale — E2E dal backend locale** (supabase, staff seedati): topup → `set_phase` LAST_CALL → **`convert_credit`** (saldo→0, ticket **0→15**, irreversibile) → `set_phase` ESTRAZIONE → **`run_draw`** (3 vincitori, seed) → **`my_draw_result` COERENTE** con `draws.winners` (win: vinto=true premio "2° posto"; lose: vinto=false). `tsc` pulito; `next build` (api) verde (`/api/guest/draw-result`, /guest 11.5kB, /regia 10.4kB).
+- 🔴→✅ **Sicurezza (trovata dall'E2E)**: sul **supabase locale mancava `0002`** (`draws_select`= `true`) → l'ospite leggeva TUTTI i vincitori (GDPR leak). **Applicato 0002 al locale** → guest legge draws = 0 righe (bloccato), `my_draw_result` regge (SECURITY DEFINER). **Verificato che PROD è già a posto** (`draws_select = is_staff()`). Nota: `0008` (+ `0005/0006/0007`) da applicare a prod al go-live.
+
 ### M3 — sessioni tap: arena ospite G7/G8 + leaderboard regia R3 ✅
 - **Workflow multi-agente** (enabler ∥ → UI ∥ → review, file-disgiunti). Nessuna migration: RLS `sessions_select`/`taps_select` già sufficienti.
 - **Enabler read**: `GET /api/session/active?event=` (guest-safe, requireAuth; sessione `stato='active' AND now()<=ends_at`, ritorna `{session_id, scadenza, secondi_rimasti}`) + `getActiveSession` (lib/rpc.ts). `GET /api/regia/session/leaderboard?session=` (staff; `taps` JOIN `guests`, 1 riga per (session,guest) → nessuna aggregazione) + `getLeaderboard`/`LeaderboardRow` (lib/regia.ts).
